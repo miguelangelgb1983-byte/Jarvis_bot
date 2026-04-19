@@ -13,11 +13,13 @@ PORT             = int(os.environ.get("PORT", 8080))
 
 logging.basicConfig(level=logging.INFO)
 
-SYSTEM = """Eres JARVIS, analista financiero senior y asistente privado de inversión de Miki.
-HOY ES ABRIL 2026. Siempre usa año 2026. Nunca 2024 ni 2025.
+def get_system():
+    hoy = datetime.now().strftime("%d/%m/%Y")
+    return f"""Eres JARVIS, analista financiero senior y asistente privado de inversión de Miki.
+FECHA DE HOY: {hoy}. SIEMPRE usa esta fecha exacta. NUNCA pongas 2024 ni 2025.
 
-FORMATO VALORACIÓN (obligatorio siempre):
-[TICKER] — [DD/MM/2026]
+FORMATO VALORACIÓN (obligatorio siempre que analices una empresa):
+[TICKER] — {hoy}
 Precio: $X | Val.Int: $X | Margen: X%
 PER: Xx | FCF: $XB
 Señal: COMPRAR/ACUMULAR/MANTENER/VIGILAR/REDUCIR/VENDER
@@ -25,31 +27,33 @@ Motivo: [1 línea]
 Red flag: [1 línea si existe]
 
 FORMATO NOTICIA:
-[TICKER] — Alerta [DD/MM/2026]
+[TICKER] — Alerta {hoy}
 [Hecho en 1 línea]
 Impacto: [1 línea]
 Señal: [actualizada]
 
 FORMATO MACRO:
-Macro [DD/MM/2026]: [2-3 datos clave]
+Macro {hoy}: [2-3 datos clave]
 Impacto cartera: [1 línea]
 
 FORMATO CUALQUIER PREGUNTA:
 Máximo 4 líneas. Directo. Sin relleno. Sin párrafos.
 
-REGLAS:
-- Si recibes DATOS VERIFICADOS HOY úsalos siempre para el precio
-- Nunca inventar precios ni métricas
-- Nunca más de 8 líneas
-- Nunca fechas antes de 2026
+REGLAS ABSOLUTAS:
+- Usa los DATOS VERIFICADOS HOY que recibes — son precios reales de internet
+- Si no hay precio verificado dilo claramente: "precio no encontrado hoy"
+- Nunca inventar PER, FCF ni métricas — si no están en los datos verificados dilo
+- Nunca más de 8 líneas totales
+- Nunca fechas anteriores a {datetime.now().year}
 
-CARTERA MIKI — €34.145 · +22.03% — Abril 2026:
+CARTERA MIKI — €34.145 · +22.03% — {hoy}:
 GOOGL €6.071 +77.4% | SP500 €5.118 +24.1% | Europe €4.288 +23.3%
 SmCap €3.900 +24.5% | MONC €2.596 -3.8% | JNJ €1.883 +61.4%
 AAPL €1.793 +20.6% | MSFT €1.522 -12.5% | SSNC €1.420 +5.5%
 India €1.287 -7.4% | TRET €1.265 +6.9% | TXRH €898 -4.1%
 Gold €787 +41.9% | ZEG €694 +70.8% | VISA €637 nueva | CELH €186 +20.9%
-NKE: VENDIDA — EARNINGS: MONC 21/04 · VISA 28/04 · MSFT 29/04"""
+NKE: VENDIDA
+EARNINGS PRÓXIMOS: MONC 21/04 · VISA 28/04 · MSFT 29/04"""
 
 history = {}
 
@@ -85,43 +89,64 @@ def load_memory(chat_id, limit=6):
     except:
         return []
 
+TICKER_NAMES = {
+    "GOOGL": "Alphabet Google GOOGL stock price",
+    "MSFT": "Microsoft MSFT stock price",
+    "AAPL": "Apple AAPL stock price",
+    "JNJ": "Johnson Johnson JNJ stock price",
+    "MONC": "Moncler MONC stock price Milan",
+    "VISA": "Visa V stock price",
+    "ZEG": "Zegona ZEG stock price London",
+    "SSNC": "SS&C Technologies SSNC stock price",
+    "TXRH": "Texas Roadhouse TXRH stock price",
+    "CELH": "Celsius Holdings CELH stock price",
+    "TRET": "VanEck Real Estate TRET ETF price",
+}
+
 def search_price(ticker):
     if not TAVILY_KEY:
         return ""
+    nombre = TICKER_NAMES.get(ticker.upper(), f"{ticker} stock price")
+    mes = datetime.now().strftime("%B %Y")
     try:
         r = requests.post(
             "https://api.tavily.com/search",
             json={"api_key": TAVILY_KEY,
-                  "query": f"{ticker} stock price today 2026 current",
-                  "max_results": 3, "search_depth": "basic"},
-            timeout=10
+                  "query": f"{nombre} today {mes}",
+                  "max_results": 3,
+                  "search_depth": "basic"},
+            timeout=12
         )
         results = r.json().get("results", [])
-        return "\n".join([f"{x['title']}: {x['content'][:250]}" for x in results[:3]])
-    except:
+        return "\n".join([f"{x['title']}: {x['content'][:300]}" for x in results[:3]])
+    except Exception as e:
+        logging.error(f"search_price {ticker}: {e}")
         return ""
 
 def search_web(query):
     if not TAVILY_KEY:
         return ""
+    mes = datetime.now().strftime("%B %Y")
     try:
         r = requests.post(
             "https://api.tavily.com/search",
             json={"api_key": TAVILY_KEY,
-                  "query": query + " 2026",
-                  "max_results": 3, "search_depth": "basic"},
-            timeout=10
+                  "query": f"{query} {mes}",
+                  "max_results": 3,
+                  "search_depth": "basic"},
+            timeout=12
         )
         results = r.json().get("results", [])
-        return "\n".join([f"{x['title']}: {x['content'][:250]}" for x in results[:3]])
-    except:
+        return "\n".join([f"{x['title']}: {x['content'][:300]}" for x in results[:3]])
+    except Exception as e:
+        logging.error(f"search_web: {e}")
         return ""
 
 def ask_claude(chat_id, text, extra=""):
     persistent = load_memory(chat_id, limit=4)
     if chat_id not in history:
         history[chat_id] = []
-    full = f"{text}\n\nDATOS VERIFICADOS HOY:\n{extra}" if extra else text
+    full = f"{text}\n\nDATOS VERIFICADOS HOY ({datetime.now().strftime('%d/%m/%Y')}):\n{extra}" if extra else text
     history[chat_id].append({"role": "user", "content": full})
     msgs = persistent[-4:] + history[chat_id][-6:]
     try:
@@ -130,7 +155,7 @@ def ask_claude(chat_id, text, extra=""):
             headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01",
                      "content-type": "application/json"},
             json={"model": "claude-sonnet-4-20250514", "max_tokens": 400,
-                  "system": SYSTEM, "messages": msgs},
+                  "system": get_system(), "messages": msgs},
             timeout=45
         )
         data = r.json()
@@ -176,49 +201,71 @@ def send_audio(chat_id, audio):
     except Exception as e:
         logging.error(f"audio: {e}")
 
-TICKERS = ["GOOGL","MSFT","AAPL","JNJ","MONC","VISA","ZEG","SSNC","TXRH","CELH","TRET","CELH"]
-
 def handle(chat_id, text):
     txt = text.strip()
     cmd = txt.lower().split()[0] if txt.startswith("/") else None
+    hoy = datetime.now().strftime("%d/%m/%Y")
 
     if cmd == "/start":
-        send(chat_id, "JARVIS activo — Abril 2026\nCartera: €34.145 · +22.03%\nEarnings: MONC 21/04 · VISA 28/04 · MSFT 29/04\n\n/analiza TICKER · /cartera · /alertas · /earnings · /macro")
+        send(chat_id,
+             f"JARVIS activo — {hoy}\n"
+             "Cartera: €34.145 · +22.03%\n"
+             "Earnings: MONC 21/04 · VISA 28/04 · MSFT 29/04\n\n"
+             "/analiza TICKER · /cartera · /alertas · /earnings · /macro\n"
+             "O escríbeme directamente.")
 
     elif cmd == "/cartera":
-        send(chat_id, "CARTERA · €34.145 · +22.03%\nGOOGL +77.4% · ZEG +70.8% · JNJ +61.4% · Gold +41.9%\nSP500 +24.1% · SmCap +24.5% · Europe +23.3%\nAAPL +20.6% · CELH +20.9% · TRET +6.9% · SSNC +5.5%\nVISA nueva · TXRH -4.1% · MONC -3.8% · India -7.4% · MSFT -12.5%")
+        send(chat_id,
+             f"CARTERA · €34.145 · +22.03% · {hoy}\n"
+             "GOOGL +77.4% · ZEG +70.8% · JNJ +61.4% · Gold +41.9%\n"
+             "SP500 +24.1% · SmCap +24.5% · Europe +23.3%\n"
+             "AAPL +20.6% · CELH +20.9% · TRET +6.9% · SSNC +5.5%\n"
+             "VISA nueva · TXRH -4.1% · MONC -3.8% · India -7.4% · MSFT -12.5%")
 
     elif cmd == "/alertas":
-        send(chat_id, "ALERTAS — Abril 2026\nVIGILAR: MSFT -12.5% · earnings 29/04\nVIGILAR: MONC -3.8% · earnings 21/04\nVIGILAR: India -7.4%\nNUEVA: VISA · earnings 28/04")
+        send(chat_id,
+             f"ALERTAS — {hoy}\n"
+             "VIGILAR: MSFT -12.5% · earnings 29/04\n"
+             "VIGILAR: MONC -3.8% · earnings 21/04\n"
+             "VIGILAR: India -7.4%\n"
+             "NUEVA: VISA · earnings 28/04")
 
     elif cmd == "/analiza":
         parts = txt.split()
         if len(parts) < 2:
-            send(chat_id, "Uso: /analiza TICKER")
+            send(chat_id, "Uso: /analiza TICKER\nEj: /analiza MSFT")
             return
         ticker = parts[1].upper()
         send(chat_id, f"Buscando {ticker}...")
         price_data = search_price(ticker)
-        reply = ask_claude(chat_id, f"Valoración de {ticker} hoy. Usa formato plantilla exacto.", extra=price_data)
+        reply = ask_claude(chat_id,
+            f"Valoración completa de {ticker} hoy {hoy}. Usa formato plantilla exacto con los datos verificados que recibes.",
+            extra=price_data)
         send(chat_id, reply)
         audio = tts(reply)
         if audio:
             send_audio(chat_id, audio)
 
     elif cmd == "/earnings":
-        data = search_web("earnings dates GOOGL AAPL MSFT JNJ MONC VISA 2026 Q1 Q2")
-        reply = ask_claude(chat_id, "Earnings próximos 60 días cartera Miki. Solo fechas verificadas. Lista corta.", extra=data)
+        data = search_web("earnings results dates GOOGL AAPL MSFT JNJ MONC VISA Q2 2026")
+        reply = ask_claude(chat_id,
+            f"Earnings próximos 60 días de la cartera de Miki a {hoy}. Solo fechas verificadas. Lista corta.",
+            extra=data)
         send(chat_id, reply)
 
     elif cmd == "/macro":
-        data = search_web("FED inflacion VIX SP500 mercados abril 2026")
-        reply = ask_claude(chat_id, "Macro verificada hoy: FED, inflación, VIX, dólar. Impacto cartera. Max 4 líneas.", extra=data)
+        data = search_web("FED inflacion VIX SP500 mercados hoy")
+        reply = ask_claude(chat_id,
+            f"Macro verificada hoy {hoy}: FED, inflación, VIX, dólar. Impacto en cartera Miki. Max 4 líneas.",
+            extra=data)
         send(chat_id, reply)
 
     else:
+        # Detectar ticker en mensaje libre
         extra = ""
-        for t in TICKERS:
-            if t.lower() in txt.lower():
+        txt_up = txt.upper()
+        for t in TICKER_NAMES:
+            if t in txt_up:
                 extra = search_price(t)
                 break
         if not extra:
@@ -231,11 +278,12 @@ def handle(chat_id, text):
 
 def poll():
     offset = 0
-    logging.info("JARVIS iniciado — Abril 2026")
+    logging.info(f"JARVIS polling iniciado — {datetime.now().strftime('%d/%m/%Y')}")
     while True:
         try:
-            r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-                             params={"offset": offset, "timeout": 30}, timeout=35)
+            r = requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                params={"offset": offset, "timeout": 30}, timeout=35)
             for u in r.json().get("result", []):
                 offset = u["update_id"] + 1
                 msg = u.get("message", {})
@@ -249,9 +297,8 @@ def poll():
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200); self.end_headers()
-        self.wfile.write(b"JARVIS activo — Abril 2026")
+        self.wfile.write(f"JARVIS activo — {datetime.now().strftime('%d/%m/%Y')}".encode())
     def log_message(self, *a): pass
 
 threading.Thread(target=poll, daemon=True).start()
 HTTPServer(("0.0.0.0", PORT), H).serve_forever()
-
