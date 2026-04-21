@@ -462,9 +462,55 @@ def poll():
             logging.error(f"Poll: {e}")
 
 class H(BaseHTTPRequestHandler):
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
     def do_GET(self):
-        self.send_response(200); self.end_headers()
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
         self.wfile.write(f"JARVIS DEFINITIVO — {datetime.now().strftime('%d/%m/%Y')} — Online".encode())
+
+    def do_POST(self):
+        import json
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+            msg = body.get("message", "")
+            chat_id = body.get("chat_id", "webapp")
+            if not msg:
+                raise ValueError("No message")
+
+            # Busca datos web si el mensaje lo requiere
+            web = ""
+            txt_up = msg.upper()
+            txt_low = msg.lower()
+            for t in TICKER_QUERIES:
+                if t in txt_up or t.lower() in txt_low:
+                    web = search_ticker(t)
+                    break
+            if not web and any(p in txt_low for p in ["cartera","per","macro","fed","inflacion","vix","earnings"]):
+                web = search(msg[:80], n=2)
+
+            reply = ask_claude(chat_id, msg, web_data=web, max_tokens=600)
+
+            resp = json.dumps({"reply": reply}, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(resp)
+        except Exception as e:
+            logging.error(f"POST error: {e}")
+            self.send_response(500)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
+
     def log_message(self, *a): pass
 
 threading.Thread(target=poll, daemon=True).start()
