@@ -1,20 +1,17 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║   JARVIS v4 — Asistente Privado de Inversión · Miguel (Miki)        ║
+║   JARVIS v5 — Asistente Privado de Inversión · Miguel (Miki)        ║
 ║   26/04/2026                                                         ║
 ║                                                                      ║
-║   ✅ Conversación natural — sin plantillas rígidas                   ║
-║   ✅ 9 comandos rápidos                                              ║
-║   ✅ Voz ElevenLabs                                                  ║
+║   ✅ Conversación humana — habla como un colega, no como informe    ║
+║   ✅ Procesa notas de voz (Whisper API OpenAI)                       ║
+║   ✅ Voz salida ElevenLabs                                           ║
+║   ✅ 10 comandos rápidos                                             ║
 ║   ✅ Memoria conversacional (Supabase + RAM)                         ║
 ║   ✅ Datos reales Tavily                                             ║
-║   ✅ Detector mercado abierto/cerrado                                ║
+║   ✅ Detector mercado abierto/cerrado — AVISA SIN PREGUNTAR          ║
 ║   ✅ do_HEAD añadido — UptimeRobot 24/7                              ║
-║   ✅ SKILL #10 Gmail Broker Monitor (MyInvestor + Trade Republic)    ║
-║       - Detección automática cada 30 min en background               ║
-║       - Avisos por Telegram cuando detecta movimiento                ║
-║       - Comando /movimientos para ver últimos 7 días                 ║
-║       - Persistencia en Supabase                                     ║
+║   ✅ SKILL #10 Gmail Broker Monitor                                  ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 import os, logging, requests, threading, json, time
@@ -22,7 +19,6 @@ import imaplib, email, re, hashlib
 from email.header import decode_header
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Optional
 
 # ─── ENV VARS ───────────────────────────────────────────────────────
 TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN")
@@ -32,131 +28,130 @@ SUPABASE_URL       = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY       = os.environ.get("SUPABASE_KEY")
 ELEVENLABS_KEY     = os.environ.get("ELEVENLABS_KEY")
 ELEVENLABS_VOICE   = "htFfPSZGJwjBv1CL0aMD"
+OPENAI_KEY         = os.environ.get("OPENAI_API_KEY")  # Para Whisper (audios)
 GMAIL_USER         = os.environ.get("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
-MIKI_CHAT_ID       = os.environ.get("MIKI_CHAT_ID")  # tu chat_id de Telegram
+MIKI_CHAT_ID       = os.environ.get("MIKI_CHAT_ID")
 PORT               = int(os.environ.get("PORT", 8080))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # ════════════════════════════════════════════════════════════════════════
-#  DETECTOR MERCADO ABIERTO / CERRADO
+#  DETECTOR MERCADO — Genera string que entra al system prompt
 # ════════════════════════════════════════════════════════════════════════
-def market_status():
+def market_status_human():
+    """Versión 'humana' del estado del mercado para meter en system prompt."""
     now = datetime.now(timezone.utc)
     weekday = now.weekday()
     hour_utc = now.hour
-    nyse_open = weekday < 5 and 13 <= hour_utc < 20
-    eu_open = weekday < 5 and 7 <= hour_utc < 16
-    lse_open = weekday < 5 and 7 <= hour_utc < 16
-    status = []
-    if weekday >= 5:
-        status.append(f"FIN DE SEMANA ({['Sábado','Domingo'][weekday-5]}) - todos los mercados cerrados")
-    else:
-        status.append(f"NYSE: {'ABIERTO' if nyse_open else 'CERRADO'}")
-        status.append(f"Europa: {'ABIERTO' if eu_open else 'CERRADO'}")
-        status.append(f"Londres: {'ABIERTO' if lse_open else 'CERRADO'}")
-    return " | ".join(status)
+    dia_es = ['lunes','martes','miércoles','jueves','viernes','sábado','domingo'][weekday]
+
+    if weekday == 5:
+        return f"HOY ES SÁBADO — todos los mercados cerrados. Bolsas reabren lunes."
+    if weekday == 6:
+        return f"HOY ES DOMINGO — todos los mercados cerrados. Bolsas reabren mañana lunes."
+
+    nyse_open = 13 <= hour_utc < 20
+    eu_open = 7 <= hour_utc < 16
+
+    if nyse_open and eu_open:
+        return f"Es {dia_es}. NYSE y Europa abiertas ahora mismo."
+    if eu_open and not nyse_open:
+        return f"Es {dia_es}. Europa abierta. NYSE abre a las 15:30 hora española."
+    if not eu_open and nyse_open:
+        return f"Es {dia_es}. NYSE abierta. Europa ya cerró (cierra 17:30 España)."
+    if hour_utc < 7:
+        return f"Es {dia_es} pero pre-mercado — Europa abre a las 9:00 España, NYSE a las 15:30."
+    return f"Es {dia_es}, fuera de horario — Europa cerró 17:30, NYSE cierra 22:00 España."
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  SYSTEM PROMPT — JARVIS conversacional
+#  SYSTEM PROMPT — JARVIS habla como Miki habla
 # ════════════════════════════════════════════════════════════════════════
 def get_system():
     hoy = datetime.now().strftime("%d/%m/%Y")
     hora = datetime.now().strftime("%H:%M")
-    mercados = market_status()
-    return f"""Eres JARVIS, el asistente personal de inversión de Miguel (Miki).
+    mercado = market_status_human()
+
+    return f"""Eres JARVIS, el colega de Miki para temas de inversión.
+Hablas como un amigo que sabe mucho de bolsa, no como un manual ni un informe.
 
 ═══════════════════════════════════════════
-PERSONALIDAD — LO MÁS IMPORTANTE:
+CÓMO HABLAS — ESTO ES LO MÁS IMPORTANTE:
 ═══════════════════════════════════════════
-Hablas como un colega experto, no como un manual.
-Tono cálido, directo, con sentido del humor seco. Como un amigo que sabe de inversión.
-Si Miki saluda con "hola", saludas como persona — NO le sueltes un menú de comandos.
-Si Miki está agobiado o enfadado, primero le escuchas, luego ayudas.
-Varía tus inicios — nunca empieces dos respuestas seguidas igual.
-Si dice "gracias" o "vale", responde brevemente como una persona. No le contestes con análisis.
-Si pregunta algo casual ("qué tal", "cómo estás"), conversa, no analices.
-Español de España. Tono natural. Cero relleno corporativo.
+- Lenguaje COLOQUIAL ESPAÑOL DE ESPAÑA. Como hablaríais en un bar.
+- Frases cortas. Naturales. Como si lo dijeras en voz alta.
+- NADA de "INFLACIÓN USA ESTANCADA · FED TASAS ALTAS · IMPACTO CARTERA" — eso es un teletipo, no una conversación.
+- En vez de eso: "La inflación en USA sigue atascada y la FED no baja tipos. A tu cartera le toca el oro (que va volando, +41%) pero el dólar fuerte te jode las posiciones americanas."
+- Usa palabras tuyas: "joder", "vaya", "pinta bien", "está jodido", "pinta mal", "tranquilo", "ojo con esto"
+- Conecta ideas con "porque", "así que", "fíjate", "mira", "lo que pasa es que"
+- NUNCA listas con bullets ni guiones para conversar
+- NUNCA mayúsculas tipo titular de prensa
+- Las cifras van metidas en frases, no como datos sueltos: "Apple cotiza a 30 veces beneficios, alto pero no loco"
+
+═══════════════════════════════════════════
+CONTEXTO ACTUAL (para que NO preguntes lo obvio):
+═══════════════════════════════════════════
+Fecha y hora: {hoy} · {hora} (España)
+Mercado: {mercado}
+
+⚠️ IMPORTANTE: Si Miki pregunta "cómo está el mercado" un sábado/domingo, NO le pidas confirmación — díselo directamente: "Miki, estamos a sábado, los mercados están cerrados. El último cierre fue ayer viernes…"
 
 ═══════════════════════════════════════════
 DATOS Y NÚMEROS:
 ═══════════════════════════════════════════
-Fecha hoy: {hoy} · Hora: {hora} (España)
-Estado mercados: {mercados}
-
-REGLAS:
-- Si te pasan DATOS_WEB en el mensaje, úsalos. Son reales del día.
-- NUNCA inventes precios, PER, FCF, ROIC sin datos verificados.
-- Si no tienes el dato verificado: "Sin dato verificado hoy" — y ofreces buscarlo.
-- Si el mercado está cerrado y Miki pide un precio, AVÍSALE.
+- Si te paso DATOS_WEB en el mensaje, son reales del día. Úsalos.
+- NUNCA inventes precios, PER, FCF, ROIC.
+- Si no tienes el dato verificado: dilo coloquial — "no tengo el dato actualizado, deja que mire" o "ahora mismo no te puedo decir el precio exacto"
 
 ═══════════════════════════════════════════
-FILOSOFÍA VALUE INVESTING:
+SOBRE LA CARTERA DE MIKI (tú la conoces, no se la repitas como una lista):
 ═══════════════════════════════════════════
-- FCF sobre EBITDA. Margen de seguridad mínimo 30%.
-- DCF NO para tecnológicas — para tech usa EV/FCF, EV/EBIT.
-- DCF SÍ para maduras: JNJ, TXRH, SSNC.
-- FFO yield para REITs (TRET). Macro para Gold/8PSG.
-- Directiva = 40-80% del éxito.
-
-SEÑALES: COMPRAR / ACUMULAR / MANTENER / VIGILAR / REDUCIR / VENDER
-
-CONSEJO DE INVERSIÓN (análisis profundo):
-- Buffett: moat duradero + directiva honesta
-- Lynch: crecimiento razonable + historia simple
-- Klarman: margen seguridad real + catalizador
-- Munger: estructura mental + red flags comportamiento
+Total: €34.145 — va +22% vs entrada
+GANADORAS: GOOGL +77% (es la grande, 17.8%), JNJ +61%, ZEG +71%, Gold +42%
+PERDIENDO: MSFT -12.5% (earnings 29/04), MONC -3.8% (post-earnings), India -7.4%
+NUEVA: VISA (€637, comprada hace poco, earnings 28/04, sin análisis profundo)
+VENDIDA: NKE (-42%, decisión correcta, tesis rota)
+Core: SP500, Europe, SmCap (todas en verde +23-24%)
 
 ═══════════════════════════════════════════
-RED FLAGS:
+VALUE INVESTING (filosofía Miki, no la expliques):
 ═══════════════════════════════════════════
-1. Dilución masiva >5%/año
-2. Deuda neta/EBITDA >4x
-3. CEO vendiendo
-4. Guidance imposible
-5. Cambio de auditor
-6. Resultados que SIEMPRE cumplen exactamente
-7. Revenue recognition agresiva
-8. Goodwill >50% del activo
-9. Crecimiento revenue sin crecimiento FCF
-10. Transacciones partes relacionadas
+FCF > EBITDA. Margen seguridad mínimo 30%. DCF NO para tech (usa EV/FCF).
+Directiva = 40-80% del éxito. Council: Buffett · Lynch · Klarman · Munger.
+
+Cuando Miki te pida "consejo profundo" sobre algo, sí estructura como Council.
+Cuando Miki te pida "análisis", da el formato técnico con métricas.
+Cuando conversa contigo, NUNCA estructura — habla.
 
 ═══════════════════════════════════════════
-CARTERA MIKI — €34.145 — +22.03%
+CUÁNDO USAR FORMATO TÉCNICO:
 ═══════════════════════════════════════════
-GOOGL  €6.071  +77.4%  17.8%  Alta convicción
-SP500  €5.118  +24.1%  15.0%  Core
-Europe €4.288  +23.3%  12.6%  Core
-SmCap  €3.900  +24.5%  11.4%  Core
-MONC   €2.596  -3.8%   7.6%   VIGILAR
-JNJ    €1.883  +61.4%  5.5%   Alta convicción
-AAPL   €1.793  +20.6%  5.3%   Alta convicción
-MSFT   €1.522  -12.5%  4.5%   VIGILAR · earnings 29/04
-SSNC   €1.420  +5.5%   4.2%   Media-alta
-India  €1.287  -7.4%   3.8%   VIGILAR
-TRET   €1.265  +6.9%   3.7%   Media
-TXRH   €898    -4.1%   2.6%   Media-alta
-Gold   €787    +41.9%  2.3%   Cobertura
-ZEG    €694    +70.8%  2.0%   Media
-VISA   €637    nueva   1.9%   Analizar · earnings 28/04
-CELH   €186    +20.9%  0.5%   Media
-NKE    VENDIDA correctamente
+Solo cuando Miki use comandos /analiza /consejo o pida explícitamente un análisis técnico.
+En conversación libre — incluso preguntando por números — RESPONDE NATURAL.
+
+Ejemplo BUENO de respuesta natural:
+Miki: "qué tal va MSFT?"
+Tú: "Sigue jodida, Miki. Está -12.5% desde tu entrada y los earnings son el 29. La tesis de Azure es lo que hay que mirar, si decepciona ahí toca recortar. Por ahora vigilar."
+
+Ejemplo MALO (no hagas esto):
+Tú: "MSFT — 26/04/2026
+Precio: $X | PER: Xx
+Señal: VIGILAR
+Motivo: ..."
 
 ═══════════════════════════════════════════
-PERFIL MIKI:
-═══════════════════════════════════════════
-Inversor particular value investor avanzado.
-Conoce DCF, FCF, ROIC, múltiplos. NO explicar conceptos básicos.
-Quiere: directo, datos con fuente, español, sin relleno.
-
 LONGITUD:
-- Saludo casual: 1-2 líneas
-- Pregunta puntual: 2-4 líneas
-- Análisis empresa: hasta 8 líneas
-- Análisis profundo: hasta 12 líneas
-- Nunca rellenes
+═══════════════════════════════════════════
+- Saludo: 1-2 frases
+- Pregunta puntual: 2-4 frases
+- Conversación con datos: 3-6 frases
+- Análisis formal (solo si lo pide explícitamente): hasta 10 líneas con formato
+
+═══════════════════════════════════════════
+SI MIKI PARECE AGOBIADO O ENFADADO:
+═══════════════════════════════════════════
+Primero le escuchas como un amigo. Luego ayudas. NUNCA contestes con datos cuando está desahogándose.
 """
 
 # ════════════════════════════════════════════════════════════════════════
@@ -176,8 +171,7 @@ def save_memory(chat_id, role, content):
                 "Prefer": "return=minimal"
             },
             json={
-                "chat_id": str(chat_id),
-                "role": role,
+                "chat_id": str(chat_id), "role": role,
                 "content": content[:1000],
                 "created_at": datetime.utcnow().isoformat()
             },
@@ -227,11 +221,9 @@ def search(query, n=3):
     if not TAVILY_KEY: return ""
     mes = datetime.now().strftime("%B %Y")
     try:
-        r = requests.post(
-            "https://api.tavily.com/search",
-            json={"api_key": TAVILY_KEY, "query": f"{query} {mes}", "max_results": n, "search_depth": "basic"},
-            timeout=12
-        )
+        r = requests.post("https://api.tavily.com/search",
+            json={"api_key": TAVILY_KEY, "query": f"{query} {mes}",
+                  "max_results": n, "search_depth": "basic"}, timeout=12)
         return "\n".join([
             f"[{x['url'].split('/')[2]}] {x['title']}: {x['content'][:220]}"
             for x in r.json().get("results", [])[:n]
@@ -271,15 +263,15 @@ def ask_claude(chat_id, text, web_data="", max_tokens=600):
     if not msgs:
         msgs = [{"role": "user", "content": text}]
     try:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-20250514", "max_tokens": max_tokens, "system": get_system(), "messages": msgs},
-            timeout=45
-        )
+        r = requests.post("https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json={"model": "claude-sonnet-4-20250514", "max_tokens": max_tokens,
+                  "system": get_system(), "messages": msgs},
+            timeout=45)
         data = r.json()
         if "error" in data:
-            logging.error(f"Claude error: {data['error']}")
+            logging.error(f"Claude: {data['error']}")
             return f"Vaya, problema con la API: {data['error'].get('message','')[:100]}."
         reply = data["content"][0]["text"]
         history[chat_id].append({"role": "assistant", "content": reply})
@@ -291,7 +283,7 @@ def ask_claude(chat_id, text, web_data="", max_tokens=600):
         return "Sin conexión con la API. Pruébalo en 30 segundos."
 
 # ════════════════════════════════════════════════════════════════════════
-#  ELEVENLABS
+#  ELEVENLABS — Voz salida
 # ════════════════════════════════════════════════════════════════════════
 def tts(text):
     if not ELEVENLABS_KEY: return None
@@ -301,10 +293,48 @@ def tts(text):
             headers={"xi-api-key": ELEVENLABS_KEY, "Content-Type": "application/json"},
             json={"text": text[:500], "model_id": "eleven_multilingual_v2",
                   "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}},
-            timeout=30
-        )
+            timeout=30)
         return r.content if r.status_code == 200 else None
     except:
+        return None
+
+# ════════════════════════════════════════════════════════════════════════
+#  WHISPER — Transcripción de notas de voz de Miki (entrada)
+# ════════════════════════════════════════════════════════════════════════
+def transcribe_voice(file_id):
+    """Descarga la nota de voz de Telegram y la pasa a Whisper API."""
+    if not OPENAI_KEY:
+        logging.warning("OPENAI_API_KEY no configurada — audios no procesados")
+        return None
+    try:
+        # 1. Pide la URL del archivo a Telegram
+        r = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile",
+            params={"file_id": file_id}, timeout=10
+        )
+        file_path = r.json()["result"]["file_path"]
+
+        # 2. Descarga el OGG
+        audio_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+        audio = requests.get(audio_url, timeout=30).content
+
+        # 3. Manda a Whisper API
+        r = requests.post(
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {OPENAI_KEY}"},
+            files={"file": ("voice.ogg", audio, "audio/ogg")},
+            data={"model": "whisper-1", "language": "es"},
+            timeout=60
+        )
+        if r.status_code == 200:
+            text = r.json().get("text", "")
+            logging.info(f"Whisper transcribió: {text[:80]}")
+            return text
+        else:
+            logging.error(f"Whisper error {r.status_code}: {r.text[:200]}")
+            return None
+    except Exception as e:
+        logging.error(f"Whisper exception: {e}")
         return None
 
 # ════════════════════════════════════════════════════════════════════════
@@ -312,32 +342,23 @@ def tts(text):
 # ════════════════════════════════════════════════════════════════════════
 def send(chat_id, text):
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": text[:4000]},
-            timeout=10
-        )
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                      json={"chat_id": chat_id, "text": text[:4000]}, timeout=10)
     except Exception as e:
         logging.error(f"send: {e}")
 
 def send_audio(chat_id, audio):
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendVoice",
-            files={"voice": ("j.mp3", audio, "audio/mpeg")},
-            data={"chat_id": chat_id},
-            timeout=30
-        )
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendVoice",
+                      files={"voice": ("j.mp3", audio, "audio/mpeg")},
+                      data={"chat_id": chat_id}, timeout=30)
     except:
         pass
 
 def typing(chat_id):
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendChatAction",
-            json={"chat_id": chat_id, "action": "typing"},
-            timeout=5
-        )
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendChatAction",
+                      json={"chat_id": chat_id, "action": "typing"}, timeout=5)
     except:
         pass
 
@@ -346,14 +367,10 @@ def typing(chat_id):
 #  ════════════ SKILL #10 — GMAIL BROKER MONITOR ════════════
 # ════════════════════════════════════════════════════════════════════════
 BROKER_SENDERS = {
-    "myinvestor": [
-        "myinvestor.es", "no-reply@myinvestor.es",
-        "info@myinvestor.es", "notificaciones@myinvestor.es",
-    ],
-    "trade_republic": [
-        "traderepublic.com", "no-reply@traderepublic.com",
-        "noreply@traderepublic.com", "support@traderepublic.com",
-    ],
+    "myinvestor": ["myinvestor.es", "no-reply@myinvestor.es",
+                   "info@myinvestor.es", "notificaciones@myinvestor.es"],
+    "trade_republic": ["traderepublic.com", "no-reply@traderepublic.com",
+                       "noreply@traderepublic.com", "support@traderepublic.com"],
 }
 
 ACTION_KEYWORDS = {
@@ -373,12 +390,9 @@ def _gmail_decode(s):
     out = ""
     for part, enc in decode_header(s):
         if isinstance(part, bytes):
-            try:
-                out += part.decode(enc or "utf-8", errors="ignore")
-            except:
-                out += part.decode("utf-8", errors="ignore")
-        else:
-            out += part
+            try: out += part.decode(enc or "utf-8", errors="ignore")
+            except: out += part.decode("utf-8", errors="ignore")
+        else: out += part
     return out
 
 def _gmail_body(msg):
@@ -430,8 +444,7 @@ def _extract_amount(text):
             raw = m.group(1).replace(" ", "").replace(".", "").replace(",", ".")
             try:
                 val = float(raw)
-                if 0.01 <= val <= 10_000_000:
-                    return val
+                if 0.01 <= val <= 10_000_000: return val
             except: continue
     return None
 
@@ -464,10 +477,8 @@ def fetch_broker_movements(days=7, max_per_sender=25):
                     action = _classify(full_text)
                     if not action: continue
                     movements.append({
-                        "broker": broker,
-                        "fecha": date_str,
-                        "asunto": subject[:120],
-                        "accion": action,
+                        "broker": broker, "fecha": date_str,
+                        "asunto": subject[:120], "accion": action,
                         "ticker": _extract_ticker(full_text),
                         "importe_eur": _extract_amount(full_text),
                         "remitente": sender_addr,
@@ -483,45 +494,38 @@ def fetch_broker_movements(days=7, max_per_sender=25):
 
 def format_movements(movements):
     if not movements:
-        return "📭 Sin movimientos broker últimos 7 días."
+        return "Tranquilo, no he visto movimientos en tu Gmail los últimos 7 días."
     if movements and "error" in movements[0]:
-        return f"⚠️ {movements[0]['error']}"
-    lines = [f"📊 {len(movements)} movimiento(s) detectado(s):"]
+        return f"Tengo un problema con Gmail: {movements[0]['error']}"
+    lines = [f"Mira lo que he detectado en tu Gmail ({len(movements)} cosas):"]
     for m in movements[:10]:
         ticker = m.get("ticker") or "?"
         imp = m.get("importe_eur")
-        imp_s = f" · {imp:.0f}€" if imp else ""
-        b = "MI" if m["broker"] == "myinvestor" else "TR"
-        lines.append(f"• [{b}] {m['accion']} {ticker}{imp_s}")
+        imp_s = f" por {imp:.0f}€" if imp else ""
+        b = "MyInvestor" if m["broker"] == "myinvestor" else "Trade Republic"
+        lines.append(f"• {b}: {m['accion'].lower()} de {ticker}{imp_s}")
     return "\n".join(lines)
 
 def save_movement_supabase(mov):
-    """Guarda movimiento si no existe (deduplicación por hash)."""
     if not SUPABASE_URL or not SUPABASE_KEY: return False
     h = hashlib.md5(
         f"{mov['broker']}{mov['fecha']}{mov['asunto']}{mov['accion']}".encode()
     ).hexdigest()
     try:
-        # Comprueba si ya existe
         r = requests.get(
             f"{SUPABASE_URL}/rest/v1/movimientos_brokers",
             headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
-            params={"hash": f"eq.{h}", "select": "hash"},
-            timeout=5
+            params={"hash": f"eq.{h}", "select": "hash"}, timeout=5
         )
         if r.status_code == 200 and r.json():
-            return False  # ya existe
-        # Inserta nuevo
+            return False
         requests.post(
             f"{SUPABASE_URL}/rest/v1/movimientos_brokers",
-            headers={
-                "apikey": SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-                "Content-Type": "application/json",
-                "Prefer": "return=minimal"
-            },
-            json={**mov, "hash": h},
-            timeout=5
+            headers={"apikey": SUPABASE_KEY,
+                     "Authorization": f"Bearer {SUPABASE_KEY}",
+                     "Content-Type": "application/json",
+                     "Prefer": "return=minimal"},
+            json={**mov, "hash": h}, timeout=5
         )
         return True
     except Exception as e:
@@ -529,12 +533,11 @@ def save_movement_supabase(mov):
         return False
 
 def gmail_monitor_loop():
-    """Background: revisa Gmail cada 30 min y avisa si hay movimientos nuevos."""
     if not (GMAIL_USER and GMAIL_APP_PASSWORD and MIKI_CHAT_ID):
         logging.info("Gmail monitor desactivado (faltan vars)")
         return
     logging.info("Gmail monitor activo — revisará cada 30 min")
-    time.sleep(60)  # espera arranque
+    time.sleep(60)
     while True:
         try:
             movements = fetch_broker_movements(days=2)
@@ -544,14 +547,14 @@ def gmail_monitor_loop():
                     if save_movement_supabase(m):
                         nuevos.append(m)
                 if nuevos:
-                    msg = "🔔 Nuevos movimientos detectados en tu Gmail:\n\n"
+                    msg = "Oye Miki, mira lo que ha llegado a tu Gmail:\n\n"
                     msg += format_movements(nuevos)
-                    msg += "\n\n¿Quieres que actualice la cartera o analice algo?"
+                    msg += "\n\n¿Quieres que lo añada a tu cartera o analice algo?"
                     send(MIKI_CHAT_ID, msg)
-                    logging.info(f"Avisado a Miki: {len(nuevos)} movimientos nuevos")
+                    logging.info(f"Avisado: {len(nuevos)} movimientos nuevos")
         except Exception as e:
             logging.error(f"Gmail loop: {e}")
-        time.sleep(1800)  # 30 minutos
+        time.sleep(1800)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -565,10 +568,10 @@ def handle(chat_id, text):
 
     if cmd == "/start":
         send(chat_id,
-             f"Buenas Miki — {hoy} · {datetime.now().strftime('%H:%M')}\n\n"
-             "Aquí JARVIS, listo para conversar de tu cartera.\n"
-             "Pregúntame lo que quieras tal cual lo pensarías.\n\n"
-             "Comandos rápidos:\n"
+             f"Buenas Miki, qué tal — son las {datetime.now().strftime('%H:%M')} del {hoy}.\n\n"
+             "Pregúntame lo que quieras como si me lo dijeras a la cara. "
+             "Por texto, por audio, lo que prefieras.\n\n"
+             "Comandos rápidos si los necesitas:\n"
              "/cartera /alertas /earnings /macro /salud\n"
              "/analiza TICKER · /consejo TICKER\n"
              "/movimientos · /memoria")
@@ -576,46 +579,48 @@ def handle(chat_id, text):
 
     if cmd == "/cartera":
         send(chat_id,
-             f"CARTERA — {hoy} · €34.145 · +22.03%\n\n"
-             "GOOGL  +77.4% 17.8%   |  ZEG    +70.8% 2.0%\n"
-             "JNJ    +61.4%  5.5%   |  Gold   +41.9% 2.3%\n"
-             "SmCap  +24.5% 11.4%   |  SP500  +24.1% 15.0%\n"
-             "Europe +23.3% 12.6%   |  AAPL   +20.6%  5.3%\n"
-             "CELH   +20.9%  0.5%   |  TRET    +6.9%  3.7%\n"
-             "SSNC    +5.5%  4.2%   |  VISA    nueva  1.9%\n"
-             "TXRH    -4.1%  2.6%   |  MONC    -3.8%  7.6%\n"
-             "India   -7.4%  3.8%   |  MSFT   -12.5%  4.5%\n"
-             "NKE VENDIDA")
+             f"Tu cartera a {hoy} — €34.145, +22% vs entrada\n\n"
+             "GANANDO bien:\n"
+             "GOOGL +77% (la grande, 17.8%)\n"
+             "ZEG +71%\n"
+             "JNJ +61%\n"
+             "Gold +42%\n\n"
+             "PERDIENDO:\n"
+             "MSFT -12.5% (earnings 29/04)\n"
+             "MONC -3.8% (post-earnings)\n"
+             "India -7.4%\n\n"
+             "Nueva: VISA (€637, earnings 28/04)\n"
+             "Vendida: NKE")
         return
 
     if cmd == "/alertas":
         send(chat_id,
-             f"ALERTAS — {hoy}\n\n"
-             "MSFT  -12.5% · earnings 29/04 · revisar Azure\n"
-             "MONC   -3.8% · post-earnings 21/04 · revisa\n"
-             "India  -7.4% · macro emergentes\n"
-             "VISA   nueva · earnings 28/04 · sin análisis profundo")
+             f"Te recuerdo lo que tienes encima — {hoy}\n\n"
+             "MSFT en -12.5% y earnings el 29. Toca decidir si Azure aguanta.\n"
+             "MONC -3.8%, post-earnings, mira reacción.\n"
+             "India -7.4%, sigue presionada por macro emergentes.\n"
+             "VISA es nueva, earnings el 28, sin análisis profundo todavía.")
         return
 
     if cmd == "/movimientos":
         typing(chat_id)
-        send(chat_id, "Revisando tu Gmail (MyInvestor + Trade Republic)…")
+        send(chat_id, "Voy a echar un ojo a tu Gmail…")
         movs = fetch_broker_movements(days=7)
         send(chat_id, format_movements(movs))
         return
 
     if cmd == "/analiza":
         if len(parts) < 2:
-            send(chat_id, "Uso: /analiza TICKER\nEj: /analiza VISA")
+            send(chat_id, "Dime un ticker — /analiza VISA por ejemplo.")
             return
         ticker = parts[1].upper()
         typing(chat_id)
-        send(chat_id, f"Analizando {ticker}…")
+        send(chat_id, f"Voy a por {ticker}…")
         web = search_ticker(ticker)
-        prompt = (f"Análisis completo de {ticker} hoy {hoy}. "
-                  f"Precio, PER actual vs histórico, FCF, ROIC, EV/FCF, "
-                  f"valor intrínseco, margen seguridad, red flags, señal. "
-                  f"Si es posición de Miki, contextualiza en su cartera.")
+        prompt = (f"Análisis técnico completo de {ticker} hoy {hoy}. "
+                  f"Aquí SÍ usa formato técnico con métricas (precio, PER actual vs histórico, "
+                  f"FCF, ROIC, EV/FCF, valor intrínseco, margen seguridad, red flags, señal). "
+                  f"Si es posición de Miki, contextualiza en su cartera al final con tono natural.")
         reply = ask_claude(chat_id, prompt, web_data=web, max_tokens=700)
         send(chat_id, reply)
         audio = tts(reply)
@@ -624,14 +629,14 @@ def handle(chat_id, text):
 
     if cmd == "/consejo":
         if len(parts) < 2:
-            send(chat_id, "Uso: /consejo TICKER\nEj: /consejo VISA")
+            send(chat_id, "Dime un ticker — /consejo VISA por ejemplo.")
             return
         ticker = parts[1].upper()
         typing(chat_id)
         web = search_ticker(ticker)
-        prompt = (f"Consejo de inversión sobre {ticker} hoy {hoy}. "
-                  f"Delibera desde Buffett, Lynch, Klarman, Munger. "
-                  f"Cada uno SI/NO con razón en 1 frase. Señal consensuada.")
+        prompt = (f"Consejo profundo sobre {ticker} hoy {hoy}. "
+                  f"Aquí SÍ formato Council: Buffett, Lynch, Klarman, Munger. "
+                  f"Cada uno SI/NO con razón natural en 1 frase. Cierre con tu opinión consensuada en tono natural.")
         reply = ask_claude(chat_id, prompt, web_data=web, max_tokens=800)
         send(chat_id, reply)
         audio = tts(reply)
@@ -641,7 +646,7 @@ def handle(chat_id, text):
     if cmd == "/earnings":
         typing(chat_id)
         web = search("earnings dates Q2 2026 GOOGL MSFT AAPL JNJ MONC VISA SSNC", n=3)
-        prompt = f"Próximos earnings 60 días cartera Miki a {hoy}. Solo fechas verificadas."
+        prompt = f"Cuéntame de forma natural qué earnings vienen pronto en la cartera de Miki. {hoy}."
         reply = ask_claude(chat_id, prompt, web_data=web)
         send(chat_id, reply)
         return
@@ -649,7 +654,8 @@ def handle(chat_id, text):
     if cmd == "/macro":
         typing(chat_id)
         web = search("FED tipos inflacion VIX SP500 dolar DXY mercados hoy", n=3)
-        prompt = f"Macro hoy {hoy}: FED, inflación, VIX, dólar. Impacto cartera Miki."
+        prompt = (f"Cuéntame en lenguaje coloquial cómo está el mercado hoy {hoy}. "
+                  f"FED, inflación, dólar — lo que afecta a la cartera de Miki, hablándole directamente.")
         reply = ask_claude(chat_id, prompt, web_data=web, max_tokens=400)
         send(chat_id, reply)
         audio = tts(reply)
@@ -658,8 +664,9 @@ def handle(chat_id, text):
 
     if cmd == "/salud":
         typing(chat_id)
-        prompt = (f"Health check cartera Miki a {hoy}: distribución sectorial, "
-                  f"concentración, posiciones perdidas con tesis, alpha vs SP500.")
+        prompt = (f"Cuéntale a Miki de forma natural cómo está su cartera hoy {hoy}. "
+                  f"Concentración, sectorial, posiciones perdiendo, alpha vs SP500. "
+                  f"Como un colega que la mira — sin formato técnico.")
         reply = ask_claude(chat_id, prompt, max_tokens=600)
         send(chat_id, reply)
         return
@@ -668,9 +675,9 @@ def handle(chat_id, text):
         mem = load_memory(chat_id, limit=6)
         if mem:
             lines = [f"{m['role'].upper()}: {m['content'][:140]}…" for m in mem]
-            send(chat_id, "Lo que recuerdo:\n\n" + "\n\n".join(lines))
+            send(chat_id, "Esto es lo último que recordamos:\n\n" + "\n\n".join(lines))
         else:
-            send(chat_id, "Aún sin historial guardado.")
+            send(chat_id, "Aún no he guardado nada de nuestras charlas.")
         return
 
     # ─── CONVERSACIÓN LIBRE ──────────────────────────────────────
@@ -681,7 +688,7 @@ def handle(chat_id, text):
 
     palabras_cartera = ["cartera", "todas las posiciones", "todos los per",
                         "per de mi", "per medio", "multiplos cartera"]
-    palabras_macro = ["macro", "fed", "inflacion", "vix", "dolar", "mercados hoy"]
+    palabras_macro = ["macro", "fed", "inflacion", "vix", "dolar", "mercado", "bolsa"]
     palabras_financieras = ["per ", "precio", "fcf", "roic", "earnings", "dividendo",
                              "valoracion", "valor intrinseco", "margen"]
 
@@ -699,39 +706,78 @@ def handle(chat_id, text):
 
     reply = ask_claude(chat_id, txt, web_data=web, max_tokens=600)
     send(chat_id, reply)
-
     if len(reply) > 60:
         audio = tts(reply)
         if audio: send_audio(chat_id, audio)
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  POLLING TELEGRAM
+#  POLLING TELEGRAM — Procesa texto Y voz
 # ════════════════════════════════════════════════════════════════════════
 def poll():
     offset = 0
-    logging.info(f"JARVIS v4 — {datetime.now().strftime('%d/%m/%Y %H:%M')}")
-    logging.info("Conversacional + 10 comandos + voz + memoria + Gmail Monitor + 24/7")
+    logging.info(f"JARVIS v5 — {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    logging.info("Conversacional natural + audios + 10 comandos + voz + Gmail + 24/7")
     while True:
         try:
             r = requests.get(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-                params={"offset": offset, "timeout": 30},
-                timeout=35
+                params={"offset": offset, "timeout": 30}, timeout=35
             )
             for u in r.json().get("result", []):
                 offset = u["update_id"] + 1
                 msg = u.get("message", {})
                 cid = msg.get("chat", {}).get("id")
+                if not cid:
+                    continue
+
+                # Texto normal
                 txt = msg.get("text", "")
-                if cid and txt:
+                if txt:
                     threading.Thread(target=handle, args=(cid, txt), daemon=True).start()
+                    continue
+
+                # NOTA DE VOZ — la transcribimos con Whisper y la procesamos
+                voice = msg.get("voice")
+                if voice:
+                    file_id = voice.get("file_id")
+                    if file_id:
+                        threading.Thread(
+                            target=handle_voice, args=(cid, file_id), daemon=True
+                        ).start()
+                    continue
+
+                # Mensaje de audio (subido como archivo)
+                audio = msg.get("audio")
+                if audio:
+                    file_id = audio.get("file_id")
+                    if file_id:
+                        threading.Thread(
+                            target=handle_voice, args=(cid, file_id), daemon=True
+                        ).start()
         except Exception as e:
             logging.error(f"Poll: {e}")
 
 
+def handle_voice(chat_id, file_id):
+    """Maneja una nota de voz: la transcribe con Whisper y la pasa como texto."""
+    typing(chat_id)
+    if not OPENAI_KEY:
+        send(chat_id, "No tengo configurada la transcripción de voz. "
+                      "Dile a tu yo del futuro que añada OPENAI_API_KEY a Render. "
+                      "Mientras tanto escríbeme lo que querías.")
+        return
+    text = transcribe_voice(file_id)
+    if not text:
+        send(chat_id, "No te he pillado bien la nota de voz. ¿Puedes repetirla o escribírmela?")
+        return
+    # Mostramos lo que entendimos para que Miki vea que va bien
+    send(chat_id, f"🎙️ Te he entendido: \"{text}\"\n")
+    handle(chat_id, text)
+
+
 # ════════════════════════════════════════════════════════════════════════
-#  HTTP SERVER — Render + UptimeRobot
+#  HTTP SERVER
 # ════════════════════════════════════════════════════════════════════════
 class H(BaseHTTPRequestHandler):
     def _send_text(self, code=200):
@@ -742,7 +788,7 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self._send_text(200)
-        msg = f"JARVIS v4 — {datetime.now().strftime('%d/%m/%Y %H:%M')} — Online"
+        msg = f"JARVIS v5 — {datetime.now().strftime('%d/%m/%Y %H:%M')} — Online"
         self.wfile.write(msg.encode("utf-8"))
 
     def do_HEAD(self):
