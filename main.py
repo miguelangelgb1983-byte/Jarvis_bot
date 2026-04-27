@@ -1,13 +1,20 @@
 """
-JARVIS v5.1 — Asistente Privado de Inversion · Miguel (Miki)
+JARVIS v6 - Asistente Privado de Inversion · Miguel (Miki)
 26/04/2026
-+ Comando /miid para sacar tu chat ID
++ Yahoo Finance: precios reales, PER, FCF, dividendos
++ Comando /miid
++ Audios Whisper
++ Voz ElevenLabs
++ Gmail Skill #10
 """
 import os, logging, requests, threading, json, time
 import imaplib, email, re, hashlib
 from email.header import decode_header
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
+
+# Yahoo Finance
+import yfinance as yf
 
 TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_KEY      = os.environ.get("ANTHROPIC_API_KEY")
@@ -24,13 +31,105 @@ PORT               = int(os.environ.get("PORT", 8080))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+# ════════════════════════════════════════════════════════════════
+# YAHOO FINANCE - Tickers de Miki (mapeados a Yahoo)
+# ════════════════════════════════════════════════════════════════
+TICKER_MAP = {
+    "GOOGL": "GOOGL",
+    "AAPL":  "AAPL",
+    "MSFT":  "MSFT",
+    "JNJ":   "JNJ",
+    "VISA":  "V",
+    "V":     "V",
+    "SSNC":  "SSNC",
+    "TXRH":  "TXRH",
+    "CELH":  "CELH",
+    "NKE":   "NKE",
+    "MONC":  "MONC.MI",       # Borsa Italiana
+    "ZEG":   "ZEG.L",         # London
+    "TRET":  "TRET.AS",       # Amsterdam
+    "GOLD":  "GC=F",          # Oro futuros
+    "8PSG":  "8PSG.L",        # Invesco Gold London
+    "SP500": "^GSPC",
+    "INDIA": "INDA",          # iShares MSCI India
+}
+
+def get_yahoo_data(ticker_input):
+    """Devuelve datos reales de Yahoo Finance en formato legible."""
+    ticker = TICKER_MAP.get(ticker_input.upper(), ticker_input.upper())
+    try:
+        t = yf.Ticker(ticker)
+        info = t.info
+        if not info or info.get("regularMarketPrice") is None:
+            return f"Sin datos para {ticker_input}. Quizá ticker incorrecto o mercado cerrado sin histórico."
+
+        precio = info.get("regularMarketPrice") or info.get("currentPrice")
+        moneda = info.get("currency", "USD")
+        nombre = info.get("longName") or info.get("shortName") or ticker_input
+        per = info.get("trailingPE")
+        per_fwd = info.get("forwardPE")
+        market_cap = info.get("marketCap")
+        cambio_dia = info.get("regularMarketChangePercent")
+        cierre_ant = info.get("regularMarketPreviousClose")
+        max_52 = info.get("fiftyTwoWeekHigh")
+        min_52 = info.get("fiftyTwoWeekLow")
+        div_yield = info.get("dividendYield")
+        roe = info.get("returnOnEquity")
+        margen_op = info.get("operatingMargins")
+        deuda_eq = info.get("debtToEquity")
+        fcf = info.get("freeCashflow")
+
+        # Formato legible
+        lines = [f"{nombre} ({ticker})"]
+        if precio:
+            lines.append(f"Precio: {precio:.2f} {moneda}")
+        if cambio_dia is not None:
+            lines.append(f"Variación día: {cambio_dia*100:.2f}% (cierre ant: {cierre_ant:.2f})")
+        if per:
+            per_str = f"PER: {per:.1f}x"
+            if per_fwd:
+                per_str += f" (forward: {per_fwd:.1f}x)"
+            lines.append(per_str)
+        if market_cap:
+            mc_b = market_cap / 1e9
+            lines.append(f"Market cap: {mc_b:.1f}B {moneda}")
+        if max_52 and min_52:
+            lines.append(f"Rango 52s: {min_52:.2f} - {max_52:.2f}")
+        if div_yield:
+            lines.append(f"Dividend yield: {div_yield*100:.2f}%")
+        if roe:
+            lines.append(f"ROE: {roe*100:.1f}%")
+        if margen_op:
+            lines.append(f"Margen operativo: {margen_op*100:.1f}%")
+        if fcf:
+            fcf_b = fcf / 1e9
+            lines.append(f"Free Cash Flow: {fcf_b:.1f}B {moneda}")
+        if deuda_eq:
+            lines.append(f"Deuda/Equity: {deuda_eq:.1f}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        logging.error(f"Yahoo {ticker}: {e}")
+        return f"Error obteniendo datos de {ticker_input}: {e}"
+
+def get_yahoo_multi(tickers_list):
+    """Obtiene datos de varios tickers para preguntas tipo cartera."""
+    out = []
+    for t in tickers_list:
+        d = get_yahoo_data(t)
+        out.append(f"=== {t} ===\n{d}")
+    return "\n\n".join(out)
+
+# ════════════════════════════════════════════════════════════════
+# DETECTOR MERCADO
+# ════════════════════════════════════════════════════════════════
 def market_status_human():
     now = datetime.now(timezone.utc)
     weekday = now.weekday()
     hour_utc = now.hour
-    dia_es = ['lunes','martes','miercoles','jueves','viernes','sabado','domingo'][weekday]
+    dia_es = ['lunes','martes','miércoles','jueves','viernes','sábado','domingo'][weekday]
     if weekday == 5:
-        return "HOY ES SABADO - todos los mercados cerrados"
+        return "HOY ES SÁBADO - todos los mercados cerrados"
     if weekday == 6:
         return "HOY ES DOMINGO - todos los mercados cerrados"
     nyse_open = 13 <= hour_utc < 20
@@ -38,45 +137,48 @@ def market_status_human():
     if nyse_open and eu_open:
         return f"Es {dia_es}. NYSE y Europa abiertas."
     if eu_open and not nyse_open:
-        return f"Es {dia_es}. Europa abierta. NYSE abre 15:30 Espana."
+        return f"Es {dia_es}. Europa abierta. NYSE abre 15:30 España."
     if not eu_open and nyse_open:
-        return f"Es {dia_es}. NYSE abierta. Europa ya cerro."
+        return f"Es {dia_es}. NYSE abierta. Europa ya cerró."
     if hour_utc < 7:
-        return f"Es {dia_es} pre-mercado. Europa abre 9:00."
+        return f"Es {dia_es} pre-mercado."
     return f"Es {dia_es}, fuera de horario."
 
+# ════════════════════════════════════════════════════════════════
+# SYSTEM PROMPT
+# ════════════════════════════════════════════════════════════════
 def get_system():
     hoy = datetime.now().strftime("%d/%m/%Y")
     hora = datetime.now().strftime("%H:%M")
     mercado = market_status_human()
-    return f"""Eres JARVIS, el colega de Miki para temas de inversion.
+    return f"""Eres JARVIS, el colega de Miki para temas de inversión.
 Hablas como un amigo que sabe mucho de bolsa, no como un manual ni un informe.
 
-CoMO HABLAS:
-- Lenguaje COLOQUIAL ESPANOL DE ESPANA. Como hablariais en un bar.
+CÓMO HABLAS:
+- Lenguaje COLOQUIAL ESPAÑOL DE ESPAÑA. Como hablaríais en un bar.
 - Frases cortas. Naturales. Como si lo dijeras en voz alta.
-- NADA de "INFLACIoN USA ESTANCADA - FED TASAS ALTAS" - eso es un teletipo.
-- En vez: "La inflacion en USA sigue atascada y la FED no baja tipos."
-- Usa: "joder", "vaya", "pinta bien", "esta jodido", "ojo con esto"
+- NADA de "INFLACIÓN USA ESTANCADA - FED TASAS ALTAS" - eso es un teletipo.
+- En vez: "La inflación en USA sigue atascada y la FED no baja tipos."
+- Usa: "joder", "vaya", "pinta bien", "está jodido", "ojo con esto"
 - NUNCA listas con bullets para conversar
 - Las cifras van metidas en frases, no como datos sueltos
 
 CONTEXTO ACTUAL:
-Fecha: {hoy} - {hora} (Espana)
+Fecha: {hoy} - {hora} (España)
 Mercado: {mercado}
 
-Si Miki pregunta "como esta el mercado" un sabado/domingo, NO le pidas confirmacion,
-diselo directo: "Miki, estamos a sabado, los mercados estan cerrados."
+Si Miki pregunta "cómo está el mercado" un sábado/domingo, NO le pidas confirmación,
+díselo directo: "Miki, estamos a sábado, los mercados están cerrados."
 
 DATOS:
-- Si te paso DATOS_WEB, son reales del dia. Usalos.
-- NUNCA inventes precios, PER, FCF.
-- Si no tienes el dato: "no tengo el dato actualizado, deja que mire"
+- Si te paso DATOS_YAHOO en el mensaje, son REALES de Yahoo Finance ahora mismo. Úsalos sin dudar.
+- Esos datos son PRECIO ACTUAL VERIFICADO. No los pongas en duda.
+- NUNCA inventes precios. Si no tienes el dato: "no lo tengo verificado ahora, deja que mire"
 
-CARTERA MIKI - 34145 EUR - +22%:
+CARTERA MIKI - €34.145 - +22%:
 GANANDO: GOOGL +77% (la grande, 17.8%), JNJ +61%, ZEG +71%, Gold +42%
 PERDIENDO: MSFT -12.5% (earnings 29/04), MONC -3.8%, India -7.4%
-NUEVA: VISA (637 EUR, earnings 28/04)
+NUEVA: VISA (€637, earnings 28/04)
 VENDIDA: NKE
 Core: SP500, Europe, SmCap (todas +23-24%)
 
@@ -84,18 +186,21 @@ VALUE INVESTING:
 FCF > EBITDA. Margen seguridad min 30%. DCF NO para tech.
 Council: Buffett, Lynch, Klarman, Munger.
 
-CUANDO USAR FORMATO TECNICO:
-Solo cuando Miki use /analiza o /consejo. En conversacion libre RESPONDE NATURAL.
+CUÁNDO USAR FORMATO TÉCNICO:
+Solo cuando Miki use /analiza o /consejo. En conversación libre RESPONDE NATURAL.
 
 LONGITUD:
 - Saludo: 1-2 frases
 - Pregunta puntual: 2-4 frases
-- Conversacion con datos: 3-6 frases
-- Analisis formal solo si pide: hasta 10 lineas
+- Conversación con datos: 3-6 frases
+- Análisis formal solo si pide: hasta 10 líneas
 
 Si Miki parece agobiado, primero le escuchas como amigo. Luego ayudas.
 """
 
+# ════════════════════════════════════════════════════════════════
+# MEMORIA SUPABASE
+# ════════════════════════════════════════════════════════════════
 history = {}
 
 def save_memory(chat_id, role, content):
@@ -121,52 +226,29 @@ def load_memory(chat_id, limit=8):
             if isinstance(rows, list) else []
     except: return []
 
-TICKER_QUERIES = {
-    "GOOGL": "Alphabet Google GOOGL stock price PER FCF earnings today",
-    "AAPL":  "Apple AAPL stock price PER FCF earnings today",
-    "MSFT":  "Microsoft MSFT stock price PER FCF Azure earnings today",
-    "MONC":  "Moncler MONC azione prezzo PER FCF oggi Borsa Italia",
-    "JNJ":   "Johnson Johnson JNJ stock price PER FCF dividend today",
-    "VISA":  "Visa V stock price PER FCF earnings today",
-    "ZEG":   "Zegona Communications ZEG stock price London today",
-    "SSNC":  "SSC Technologies SSNC stock price PER FCF today",
-    "TXRH":  "Texas Roadhouse TXRH stock price PER FCF today",
-    "CELH":  "Celsius Holdings CELH stock price PER today",
-    "TRET":  "VanEck Real Estate TRET ETF price NAV FFO today",
-    "GOLD":  "Gold XAU price today spot per ounce",
-    "8PSG":  "Invesco Physical Gold ETC 8PSG price London today",
-    "NKE":   "Nike NKE stock price today",
-    "SP500": "SP500 SP500 index price today",
-    "INDIA": "iShares MSCI India ETF price today",
-}
-
-def search(query, n=3):
+# ════════════════════════════════════════════════════════════════
+# TAVILY - Solo para noticias (precios siempre Yahoo)
+# ════════════════════════════════════════════════════════════════
+def search_news(query, n=2):
     if not TAVILY_KEY: return ""
-    mes = datetime.now().strftime("%B %Y")
     try:
         r = requests.post("https://api.tavily.com/search",
-            json={"api_key": TAVILY_KEY, "query": f"{query} {mes}",
+            json={"api_key": TAVILY_KEY, "query": query,
                   "max_results": n, "search_depth": "basic"}, timeout=12)
         return "\n".join([
-            f"[{x['url'].split('/')[2]}] {x['title']}: {x['content'][:220]}"
+            f"[{x['url'].split('/')[2]}] {x['title']}: {x['content'][:200]}"
             for x in r.json().get("results", [])[:n]
         ])
     except: return ""
 
-def search_ticker(ticker):
-    q = TICKER_QUERIES.get(ticker.upper(), f"{ticker} stock price PER FCF today")
-    return search(q, n=3)
-
-def search_cartera():
-    w1 = search("GOOGL MSFT AAPL JNJ VISA PER price FCF today stock", n=3)
-    w2 = search("Moncler MONC SSNC TXRH CELH ZEG PER price today", n=2)
-    return w1 + "\n" + w2
-
+# ════════════════════════════════════════════════════════════════
+# CLAUDE
+# ════════════════════════════════════════════════════════════════
 def ask_claude(chat_id, text, web_data="", max_tokens=600):
     mem = load_memory(chat_id, limit=6)
     if chat_id not in history: history[chat_id] = []
     hoy = datetime.now().strftime("%d/%m/%Y")
-    content = f"{text}\n\nDATOS_WEB ({hoy}):\n{web_data}" if web_data else text
+    content = f"{text}\n\nDATOS_YAHOO ({hoy}):\n{web_data}" if web_data else text
     history[chat_id].append({"role": "user", "content": content})
     all_msgs = mem + history[chat_id][-6:]
     msgs = []
@@ -197,8 +279,11 @@ def ask_claude(chat_id, text, web_data="", max_tokens=600):
         return reply
     except Exception as e:
         logging.error(f"Claude: {e}")
-        return "Sin conexion con la API. Pruebalo en 30 segundos."
+        return "Sin conexión con la API. Pruébalo en 30 segundos."
 
+# ════════════════════════════════════════════════════════════════
+# ELEVENLABS + WHISPER + TELEGRAM
+# ════════════════════════════════════════════════════════════════
 def tts(text):
     if not ELEVENLABS_KEY: return None
     try:
@@ -249,7 +334,9 @@ def typing(chat_id):
                       json={"chat_id": chat_id, "action": "typing"}, timeout=5)
     except: pass
 
-# Gmail Skill #10
+# ════════════════════════════════════════════════════════════════
+# GMAIL SKILL #10
+# ════════════════════════════════════════════════════════════════
 BROKER_SENDERS = {
     "myinvestor": ["myinvestor.es", "no-reply@myinvestor.es"],
     "trade_republic": ["traderepublic.com", "no-reply@traderepublic.com"],
@@ -296,13 +383,13 @@ def _classify(text):
         if any(k in t for k in kws): return action
     return None
 
-def _extract_ticker(text):
+def _extract_ticker_email(text):
     m = re.search(r"\(([A-Z]{1,5})\)", text)
     if m: return m.group(1)
     return None
 
 def _extract_amount(text):
-    m = re.search(r"([\d]+(?:[.,]\d{1,2})?)\s*(?:EUR|EUR)", text)
+    m = re.search(r"([\d]+(?:[.,]\d{1,2})?)\s*EUR", text)
     if m:
         try: return float(m.group(1).replace(",", "."))
         except: return None
@@ -333,7 +420,7 @@ def fetch_broker_movements(days=7):
                     movements.append({
                         "broker": broker, "fecha": msg.get("Date", ""),
                         "asunto": subject[:120], "accion": action,
-                        "ticker": _extract_ticker(full),
+                        "ticker": _extract_ticker_email(full),
                         "importe_eur": _extract_amount(full),
                     })
         mail.close()
@@ -344,7 +431,7 @@ def fetch_broker_movements(days=7):
 
 def format_movements(movements):
     if not movements:
-        return "Tranquilo, no he visto movimientos en tu Gmail los ultimos 7 dias."
+        return "Tranquilo, no he visto movimientos en tu Gmail los últimos 7 días."
     if movements and "error" in movements[0]:
         return f"Tengo un problema con Gmail: {movements[0]['error']}"
     lines = [f"He detectado {len(movements)} cosas en tu Gmail:"]
@@ -370,41 +457,66 @@ def gmail_monitor_loop():
         except: pass
         time.sleep(1800)
 
+# ════════════════════════════════════════════════════════════════
+# DETECCIÓN AUTO DE TICKER EN TEXTO
+# ════════════════════════════════════════════════════════════════
+TICKER_KEYWORDS = {
+    "GOOGL": ["googl", "google", "alphabet"],
+    "AAPL":  ["aapl", "apple", "manzana"],
+    "MSFT":  ["msft", "microsoft"],
+    "JNJ":   ["jnj", "johnson"],
+    "VISA":  ["visa"],
+    "SSNC":  ["ssnc"],
+    "TXRH":  ["txrh", "texas roadhouse"],
+    "CELH":  ["celh", "celsius"],
+    "NKE":   ["nke", "nike"],
+    "MONC":  ["monc", "moncler"],
+    "ZEG":   ["zeg", "zegona"],
+    "TRET":  ["tret"],
+    "GOLD":  ["oro", "gold"],
+    "SP500": ["sp500", "s&p", "sp 500"],
+    "INDIA": ["india"],
+}
+
+def detect_ticker(text):
+    txt_low = text.lower()
+    for ticker, kws in TICKER_KEYWORDS.items():
+        for kw in kws:
+            if kw in txt_low:
+                return ticker
+    return None
+
+# ════════════════════════════════════════════════════════════════
+# HANDLER
+# ════════════════════════════════════════════════════════════════
 def handle(chat_id, text):
     txt = text.strip()
     hoy = datetime.now().strftime("%d/%m/%Y")
     parts = txt.split()
     cmd = parts[0].lower() if txt.startswith("/") else None
 
-    # ============================================
-    # TRUCO: /miid - JARVIS te dice tu chat ID
-    # ============================================
     if cmd == "/miid":
-        send(chat_id, f"Tu chat ID es: {chat_id}\n\nCopialo y pasamelo.")
+        send(chat_id, f"Tu chat ID es: {chat_id}")
         return
 
     if cmd == "/start":
         send(chat_id,
              f"Buenas Miki, son las {datetime.now().strftime('%H:%M')} del {hoy}.\n\n"
-             "Preguntame lo que quieras como si me lo dijeras a la cara.\n\n"
+             "Pregúntame lo que quieras como si me lo dijeras a la cara.\n\n"
              "Comandos: /cartera /alertas /earnings /macro /salud\n"
              "/analiza TICKER /consejo TICKER /movimientos /memoria /miid")
         return
 
     if cmd == "/cartera":
-        send(chat_id,
-             f"Tu cartera a {hoy} - 34145 EUR, +22% vs entrada\n\n"
-             "GANANDO bien:\n"
-             "GOOGL +77% (la grande, 17.8%)\n"
-             "ZEG +71%\n"
-             "JNJ +61%\n"
-             "Gold +42%\n\n"
-             "PERDIENDO:\n"
-             "MSFT -12.5% (earnings 29/04)\n"
-             "MONC -3.8% (post-earnings)\n"
-             "India -7.4%\n\n"
-             "Nueva: VISA (637 EUR, earnings 28/04)\n"
-             "Vendida: NKE")
+        send(chat_id, "Voy a coger los precios actuales de toda la cartera...")
+        typing(chat_id)
+        tickers_principales = ["GOOGL", "MSFT", "AAPL", "JNJ", "VISA", "MONC", "SSNC", "TXRH", "ZEG", "CELH"]
+        datos = get_yahoo_multi(tickers_principales)
+        prompt = (f"Cuéntale a Miki cómo está su cartera HOY {hoy} de forma natural. "
+                  f"Usa los precios reales que te paso. Resume en 5-6 líneas máximo. "
+                  f"Mira si las posiciones perdedoras se han movido.")
+        reply = ask_claude(chat_id, prompt, web_data=datos, max_tokens=500)
+        send(chat_id, reply)
         return
 
     if cmd == "/alertas":
@@ -430,11 +542,12 @@ def handle(chat_id, text):
         ticker = parts[1].upper()
         typing(chat_id)
         send(chat_id, f"Voy a por {ticker}...")
-        web = search_ticker(ticker)
-        prompt = (f"Analisis tecnico completo de {ticker} hoy {hoy}. "
-                  f"Formato tecnico con metricas. "
-                  f"Si es posicion de Miki, contextualiza en cartera al final.")
-        reply = ask_claude(chat_id, prompt, web_data=web, max_tokens=700)
+        datos = get_yahoo_data(ticker)
+        prompt = (f"Análisis técnico completo de {ticker} hoy {hoy}. "
+                  f"Usa los datos reales de Yahoo que te paso. "
+                  f"Formato técnico con métricas. "
+                  f"Si es posición de Miki, contextualiza en cartera al final.")
+        reply = ask_claude(chat_id, prompt, web_data=datos, max_tokens=700)
         send(chat_id, reply)
         audio = tts(reply)
         if audio: send_audio(chat_id, audio)
@@ -446,28 +559,29 @@ def handle(chat_id, text):
             return
         ticker = parts[1].upper()
         typing(chat_id)
-        web = search_ticker(ticker)
+        datos = get_yahoo_data(ticker)
         prompt = (f"Consejo profundo sobre {ticker} hoy {hoy}. "
+                  f"Usa datos reales que te paso. "
                   f"Council: Buffett, Lynch, Klarman, Munger. "
-                  f"Cada uno SI/NO con razon natural.")
-        reply = ask_claude(chat_id, prompt, web_data=web, max_tokens=800)
+                  f"Cada uno SI/NO con razón natural.")
+        reply = ask_claude(chat_id, prompt, web_data=datos, max_tokens=800)
         send(chat_id, reply)
         audio = tts(reply)
         if audio: send_audio(chat_id, audio)
         return
 
     if cmd == "/earnings":
-        typing(chat_id)
-        web = search("earnings dates Q2 2026 GOOGL MSFT AAPL JNJ VISA", n=3)
-        prompt = f"Cuentame de forma natural que earnings vienen pronto. {hoy}."
-        reply = ask_claude(chat_id, prompt, web_data=web)
-        send(chat_id, reply)
+        send(chat_id,
+             f"Earnings próximos en tu cartera:\n\n"
+             "VISA - 28/04/2026 (martes)\n"
+             "MSFT - 29/04/2026 (miércoles)\n\n"
+             "MONC ya reportó el 21/04 - revisa si quieres comentar reacción.")
         return
 
     if cmd == "/macro":
         typing(chat_id)
-        web = search("FED tipos inflacion VIX SP500 dolar mercados hoy", n=3)
-        prompt = f"Cuentame en lenguaje coloquial como esta el mercado hoy {hoy}."
+        web = search_news("FED tipos inflacion VIX dolar mercados hoy", n=3)
+        prompt = f"Cuéntame en lenguaje coloquial cómo está el mercado hoy {hoy}."
         reply = ask_claude(chat_id, prompt, web_data=web, max_tokens=400)
         send(chat_id, reply)
         audio = tts(reply)
@@ -476,8 +590,8 @@ def handle(chat_id, text):
 
     if cmd == "/salud":
         typing(chat_id)
-        prompt = (f"Cuentale a Miki como esta su cartera hoy {hoy}. "
-                  f"Concentracion, sectorial, alpha vs SP500. Tono natural.")
+        prompt = (f"Cuéntale a Miki cómo está su cartera hoy {hoy} a vista general. "
+                  f"Concentración (GOOGL 17.8%), sectorial, alpha vs SP500. Tono natural.")
         reply = ask_claude(chat_id, prompt, max_tokens=600)
         send(chat_id, reply)
         return
@@ -486,30 +600,30 @@ def handle(chat_id, text):
         mem = load_memory(chat_id, limit=6)
         if mem:
             lines = [f"{m['role'].upper()}: {m['content'][:140]}..." for m in mem]
-            send(chat_id, "Lo ultimo que recordamos:\n\n" + "\n\n".join(lines))
+            send(chat_id, "Lo último que recordamos:\n\n" + "\n\n".join(lines))
         else:
-            send(chat_id, "Aun no he guardado nada.")
+            send(chat_id, "Aún no he guardado nada.")
         return
 
-    # Conversacion libre
+    # ─── CONVERSACIÓN LIBRE ──────────────────────────────────────
     typing(chat_id)
-    txt_up = txt.upper()
     txt_low = txt.lower()
-    web = ""
+    datos = ""
 
-    if any(p in txt_low for p in ["cartera", "todas las posiciones", "per de mi", "per medio"]):
-        web = search_cartera()
-    elif any(t in txt_up or t.lower() in txt_low for t in TICKER_QUERIES):
-        for t in TICKER_QUERIES:
-            if t in txt_up or t.lower() in txt_low:
-                web = search_ticker(t)
-                break
+    # 1. ¿Menciona un ticker concreto? -> Yahoo Finance
+    ticker_detected = detect_ticker(txt)
+    if ticker_detected:
+        datos = get_yahoo_data(ticker_detected)
+
+    # 2. ¿Pregunta por toda la cartera? -> Yahoo de las principales
+    elif any(p in txt_low for p in ["cartera", "todas las posiciones", "per de mi", "per medio"]):
+        datos = get_yahoo_multi(["GOOGL", "MSFT", "AAPL", "JNJ", "VISA", "MONC"])
+
+    # 3. ¿Pregunta macro? -> Tavily noticias
     elif any(p in txt_low for p in ["macro", "fed", "inflacion", "vix", "dolar", "mercado"]):
-        web = search("FED inflacion VIX dolar mercados hoy", n=2)
-    elif any(p in txt_low for p in ["per ", "precio", "fcf", "roic", "earnings", "valoracion"]):
-        web = search(txt[:80], n=2)
+        datos = search_news("FED inflacion VIX dolar mercados hoy", n=2)
 
-    reply = ask_claude(chat_id, txt, web_data=web, max_tokens=600)
+    reply = ask_claude(chat_id, txt, web_data=datos, max_tokens=600)
     send(chat_id, reply)
     if len(reply) > 60:
         audio = tts(reply)
@@ -518,18 +632,21 @@ def handle(chat_id, text):
 def handle_voice(chat_id, file_id):
     typing(chat_id)
     if not OPENAI_KEY:
-        send(chat_id, "No tengo configurado Whisper. Anade OPENAI_API_KEY a Render.")
+        send(chat_id, "Necesito OPENAI_API_KEY en Render para Whisper. Escríbeme texto.")
         return
     text = transcribe_voice(file_id)
     if not text:
-        send(chat_id, "No te he pillado bien la nota. Repitemela o escribela.")
+        send(chat_id, "No te he pillado bien la nota. Repítela o escríbela.")
         return
     send(chat_id, f"Te he entendido: \"{text}\"")
     handle(chat_id, text)
 
+# ════════════════════════════════════════════════════════════════
+# POLLING
+# ════════════════════════════════════════════════════════════════
 def poll():
     offset = 0
-    logging.info(f"JARVIS v5.1 - {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    logging.info(f"JARVIS v6 - {datetime.now().strftime('%d/%m/%Y %H:%M')} - Yahoo Finance ON")
     while True:
         try:
             r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
@@ -556,7 +673,7 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
-        msg = f"JARVIS v5.1 - {datetime.now().strftime('%d/%m/%Y %H:%M')} - Online"
+        msg = f"JARVIS v6 - {datetime.now().strftime('%d/%m/%Y %H:%M')} - Online (Yahoo)"
         self.wfile.write(msg.encode("utf-8"))
 
     def do_HEAD(self):
