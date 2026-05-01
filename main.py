@@ -1,9 +1,22 @@
 """
-JARVIS v9 — Miguel (Miki) — 01/05/2026
-- Plantilla visual SIEMPRE para empresas (estilo tarjeta premium)
-- Conversacion natural sin comandos (le hablas como a un colega)
-- Gmail: MyInvestor + Trade Republic + ING
-- FMP datos reales verificados
+╔══════════════════════════════════════════════════════════════════════╗
+║   JARVIS v10 — DEFINITIVO · Miguel (Miki) · 01/05/2026              ║
+║                                                                      ║
+║   ✅ FMP precios reales (NO yfinance)                                ║
+║   ✅ Tavily + fallback FED/SEC/Yahoo RSS                             ║
+║   ✅ Tarjeta visual SIEMPRE para empresas                            ║
+║   ✅ Conversación natural sin comandos                               ║
+║   ✅ Plantilla EXACTA de Miki                                        ║
+║   ✅ Validación al arranque (errores claros)                         ║
+║   ✅ Zonas horarias correctas (España + NY)                          ║
+║   ✅ Memoria SQLite + Supabase                                       ║
+║   ✅ Audios Whisper + Voz ElevenLabs                                 ║
+║   ✅ Gmail: MyInvestor + Trade Republic + ING                        ║
+║   ✅ Briefing autónomo cada 6h                                       ║
+║   ✅ Modo degradado si falta ANTHROPIC_KEY                           ║
+║   ✅ "recuerda que..." → memoria permanente                          ║
+║   ✅ do_HEAD UptimeRobot 24/7                                        ║
+╚══════════════════════════════════════════════════════════════════════╝
 """
 import os, logging, requests, threading, json, time
 import imaplib, email, re, sqlite3
@@ -13,6 +26,15 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+try:
+    from zoneinfo import ZoneInfo
+    TZ_OK = True
+except ImportError:
+    TZ_OK = False
+
+# ═════════════════════════════════════════════════════
+#  ENV VARS
+# ═════════════════════════════════════════════════════
 TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_KEY      = os.environ.get("ANTHROPIC_API_KEY")
 TAVILY_KEY         = os.environ.get("TAVILY_KEY")
@@ -27,10 +49,40 @@ MIKI_CHAT_ID       = os.environ.get("MIKI_CHAT_ID")
 FMP_KEY            = os.environ.get("FMP")
 PORT               = int(os.environ.get("PORT", 8080))
 MEMORY_DB_PATH     = os.environ.get("MEMORY_DB_PATH", "jarvis_memory.db")
+TEMPLATE_PATH      = os.environ.get("VALUATION_TEMPLATE_PATH", "miki_valuation_template.md")
 AUTONOMY_ENABLED   = os.environ.get("AUTONOMY_ENABLED", "1") == "1"
 AUTONOMY_INTERVAL_MIN = int(os.environ.get("AUTONOMY_INTERVAL_MIN", "360"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# ═════════════════════════════════════════════════════
+#  VALIDACIÓN DE ARRANQUE (de ChatGPT — buena idea)
+# ═════════════════════════════════════════════════════
+def validate_runtime_config():
+    """Valida config mínima para evitar arranques rotos."""
+    required = {"TELEGRAM_TOKEN": TELEGRAM_TOKEN}
+    missing = [k for k, v in required.items() if not v]
+    if missing:
+        raise RuntimeError(f"FALTAN variables obligatorias: {', '.join(missing)}")
+
+    optional = {
+        "ANTHROPIC_API_KEY": ANTHROPIC_KEY,
+        "FMP": FMP_KEY,
+        "TAVILY_KEY": TAVILY_KEY,
+        "OPENAI_API_KEY": OPENAI_KEY,
+        "ELEVENLABS_KEY": ELEVENLABS_KEY,
+        "SUPABASE_URL": SUPABASE_URL,
+        "SUPABASE_KEY": SUPABASE_KEY,
+        "GMAIL_USER": GMAIL_USER,
+        "GMAIL_APP_PASSWORD": GMAIL_APP_PASSWORD,
+        "MIKI_CHAT_ID": MIKI_CHAT_ID,
+    }
+    missing_optional = [k for k, v in optional.items() if not v]
+    if missing_optional:
+        logging.warning("Variables opcionales ausentes (se desactivan capacidades): %s",
+                        ", ".join(missing_optional))
+    else:
+        logging.info("✅ TODAS las variables están configuradas")
 
 # ═════════════════════════════════════════════════════
 #  TICKERS
@@ -67,14 +119,13 @@ def detect_ticker(text):
                 return ticker
     return None
 
-# Palabras que indican que es conversacion, NO datos de empresa
 CONVERSATIONAL_KEYWORDS = [
     "qué piensas", "que piensas", "qué opinas", "que opinas",
     "estoy preocupado", "estoy nervioso", "estoy contento",
-    "ayúdame", "ayudame", "consejo de", "qué hago", "que hago",
+    "ayúdame", "ayudame", "qué hago", "que hago",
     "no sé", "no se ", "estoy pensando", "tengo dudas",
     "explícame", "explicame", "cómo funciona", "como funciona",
-    "qué es ", "que es "
+    "qué es ", "que es ", "qué piensa", "noticias",
 ]
 
 def is_conversational(text):
@@ -82,32 +133,43 @@ def is_conversational(text):
     return any(p in txt_low for p in CONVERSATIONAL_KEYWORDS)
 
 # ═════════════════════════════════════════════════════
-#  FMP
+#  FMP — Precios reales con reintentos
 # ═════════════════════════════════════════════════════
-def fmp_get(endpoint, ticker):
+def fmp_get(endpoint, ticker, retries=2):
     if not FMP_KEY: return None
-    try:
-        r = requests.get(f"https://financialmodelingprep.com/api/v3/{endpoint}/{ticker}",
-                         params={"apikey": FMP_KEY}, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, list) and data: return data[0]
-    except Exception as e:
-        logging.error(f"FMP {endpoint} {ticker}: {e}")
+    for attempt in range(retries + 1):
+        try:
+            r = requests.get(f"https://financialmodelingprep.com/api/v3/{endpoint}/{ticker}",
+                             params={"apikey": FMP_KEY}, timeout=12)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list) and data:
+                    return data[0]
+                return None
+            elif r.status_code == 429:
+                logging.warning(f"FMP rate limit en {endpoint} {ticker}")
+                if attempt < retries:
+                    time.sleep(2)
+                    continue
+                return None
+        except Exception as e:
+            logging.error(f"FMP {endpoint} {ticker} attempt {attempt}: {e}")
+            if attempt < retries:
+                time.sleep(1)
+                continue
     return None
 
 def get_real_data(ticker_input):
     """Datos reales verificados estructurados."""
     ticker_up = ticker_input.upper()
     if ticker_up in EUROPEAN_TICKERS:
-        # Europeos via Tavily
         return {"is_european": True, "ticker": ticker_up,
                 "tavily": search_news(f"{ticker_input} stock price PER FCF today", n=3)}
 
     fmp_ticker = FMP_TICKERS.get(ticker_up, ticker_up)
     quote = fmp_get("quote", fmp_ticker)
     if not quote:
-        return {"error": f"No he podido sacar datos de {ticker_input}"}
+        return {"error": f"FMP no devolvió datos para {ticker_input} (puede ser rate limit o ticker no soportado)"}
 
     ratios = fmp_get("ratios-ttm", fmp_ticker) or {}
     metrics = fmp_get("key-metrics-ttm", fmp_ticker) or {}
@@ -120,6 +182,7 @@ def get_real_data(ticker_input):
         "change_pct": quote.get("changesPercentage"),
         "previous_close": quote.get("previousClose"),
         "pe": quote.get("pe") or ratios.get("priceEarningsRatioTTM"),
+        "pe_forward": ratios.get("priceEarningsToGrowthRatioTTM"),
         "eps": quote.get("eps"),
         "market_cap": quote.get("marketCap"),
         "year_high": quote.get("yearHigh"),
@@ -132,18 +195,20 @@ def get_real_data(ticker_input):
         "debt_equity": ratios.get("debtEquityRatioTTM") or ratios.get("debtToEquityTTM"),
         "dividend_yield": quote.get("dividendYield"),
         "sector": profile.get("sector"),
+        "industry": profile.get("industry"),
         "currency": profile.get("currency", "USD"),
     }
 
 def format_data_for_claude(data):
-    """Formatea datos en bloque legible para Claude."""
     if not data: return ""
-    if data.get("error"): return data["error"]
+    if data.get("error"): return f"DATOS NO DISPONIBLES: {data['error']}"
     if data.get("is_european"):
         return f"DATOS EUROPEO {data['ticker']} via Tavily:\n{data.get('tavily','')}"
 
     lines = [f"DATOS REALES VERIFICADOS FMP ({datetime.now().strftime('%d/%m/%Y %H:%M')}):"]
     lines.append(f"Empresa: {data.get('name')} ({data.get('ticker')})")
+    if data.get("sector"): lines.append(f"Sector: {data['sector']}")
+    if data.get("industry"): lines.append(f"Industria: {data['industry']}")
     if data.get("price") is not None:
         lines.append(f"Precio: ${data['price']:.2f}")
     if data.get("change_pct") is not None:
@@ -151,13 +216,18 @@ def format_data_for_claude(data):
     if data.get("previous_close"):
         lines.append(f"Cierre anterior: ${data['previous_close']:.2f}")
     if data.get("pe"):
-        lines.append(f"PER: {data['pe']:.1f}x")
+        lines.append(f"PER trailing: {data['pe']:.1f}x")
+    if data.get("pe_forward"):
+        lines.append(f"PER forward: {data['pe_forward']:.1f}x")
     if data.get("eps"):
         lines.append(f"EPS: ${data['eps']:.2f}")
     if data.get("market_cap"):
         lines.append(f"Market cap: ${data['market_cap']/1e9:.1f}B")
     if data.get("year_high") and data.get("year_low"):
         lines.append(f"Rango 52s: ${data['year_low']:.2f} - ${data['year_high']:.2f}")
+        if data.get("price"):
+            pct = (data['price'] - data['year_low']) / (data['year_high'] - data['year_low']) * 100
+            lines.append(f"Posición en rango 52s: {pct:.1f}%")
     if data.get("roe"):
         lines.append(f"ROE: {data['roe']*100:.1f}%")
     if data.get("roic"):
@@ -165,7 +235,7 @@ def format_data_for_claude(data):
     if data.get("op_margin"):
         lines.append(f"Margen operativo: {data['op_margin']*100:.1f}%")
     if data.get("fcf_per_share"):
-        lines.append(f"FCF/acción: ${data['fcf_per_share']:.2f}")
+        lines.append(f"FCF por acción: ${data['fcf_per_share']:.2f}")
     if data.get("ev_ebitda"):
         lines.append(f"EV/EBITDA: {data['ev_ebitda']:.1f}x")
     if data.get("debt_equity"):
@@ -173,8 +243,6 @@ def format_data_for_claude(data):
     if data.get("dividend_yield"):
         d = data['dividend_yield']
         lines.append(f"Dividend yield: {d*100:.2f}%" if d < 1 else f"Dividend yield: {d:.2f}%")
-    if data.get("sector"):
-        lines.append(f"Sector: {data['sector']}")
     return "\n".join(lines)
 
 def get_real_data_multi(tickers_list):
@@ -186,43 +254,84 @@ def get_real_data_multi(tickers_list):
     return "\n\n".join(parts)
 
 # ═════════════════════════════════════════════════════
-#  TAVILY
+#  TAVILY + FALLBACK FED/SEC (de ChatGPT — bueno)
 # ═════════════════════════════════════════════════════
+def _extract_rss_items(xml_text, limit=3):
+    items = re.findall(r"<item>(.*?)</item>", xml_text, flags=re.S | re.I)
+    out = []
+    for item in items[:limit]:
+        title_m = re.search(r"<title>(.*?)</title>", item, flags=re.S | re.I)
+        link_m = re.search(r"<link>(.*?)</link>", item, flags=re.S | re.I)
+        if title_m:
+            title = re.sub(r"\s+", " ", re.sub(r"<.*?>", "", title_m.group(1))).strip()
+            link = link_m.group(1).strip() if link_m else ""
+            out.append((title[:140], link))
+    return out
+
+def fallback_market_sources(query, n=3):
+    """Fuentes oficiales cuando Tavily falla."""
+    feeds = [
+        ("FED", "https://www.federalreserve.gov/feeds/press_all.xml"),
+        ("SEC", "https://www.sec.gov/news/pressreleases.rss"),
+        ("YahooMarkets", "https://feeds.finance.yahoo.com/rss/2.0/headline?s=%5EGSPC&region=US&lang=en-US"),
+    ]
+    snippets = []
+    for name, url in feeds:
+        try:
+            r = requests.get(url, timeout=10, headers={"User-Agent": "jarvis-miki/1.0"})
+            if r.status_code != 200: continue
+            for title, link in _extract_rss_items(r.text, limit=2):
+                snippets.append(f"[{name}] {title}")
+        except: continue
+    if not snippets: return ""
+    return "Fuentes oficiales:\n" + "\n".join(snippets[:n*2])
+
 def search_news(query, n=2):
-    if not TAVILY_KEY: return ""
+    if not TAVILY_KEY:
+        return fallback_market_sources(query, n=n)
     try:
         r = requests.post("https://api.tavily.com/search",
             json={"api_key": TAVILY_KEY, "query": query,
                   "max_results": n, "search_depth": "basic"}, timeout=12)
+        results = r.json().get("results", [])[:n]
+        if not results:
+            return fallback_market_sources(query, n=n)
         return "\n".join([
             f"[{x['url'].split('/')[2]}] {x['title']}: {x['content'][:200]}"
-            for x in r.json().get("results", [])[:n]
+            for x in results
         ])
-    except: return ""
+    except:
+        return fallback_market_sources(query, n=n)
 
 # ═════════════════════════════════════════════════════
-#  MERCADO
+#  MERCADO con ZoneInfo (de ChatGPT — correcto)
 # ═════════════════════════════════════════════════════
 def market_status_human():
-    now = datetime.now(timezone.utc)
-    weekday = now.weekday()
-    hour_utc = now.hour
+    if TZ_OK:
+        now_madrid = datetime.now(ZoneInfo("Europe/Madrid"))
+        now_ny = datetime.now(ZoneInfo("America/New_York"))
+        weekday = now_madrid.weekday()
+        eu_open = 9 <= now_madrid.hour < 17
+        nyse_open = (now_ny.hour > 9 or (now_ny.hour == 9 and now_ny.minute >= 30)) and now_ny.hour < 16
+    else:
+        now = datetime.now(timezone.utc)
+        weekday = now.weekday()
+        hour_utc = now.hour
+        eu_open = 7 <= hour_utc < 16
+        nyse_open = 13 <= hour_utc < 20
+
     dia_es = ['lunes','martes','miércoles','jueves','viernes','sábado','domingo'][weekday]
     if weekday == 5: return "HOY ES SÁBADO - todos los mercados cerrados"
     if weekday == 6: return "HOY ES DOMINGO - todos los mercados cerrados"
-    nyse_open = 13 <= hour_utc < 20
-    eu_open = 7 <= hour_utc < 16
     if nyse_open and eu_open: return f"Es {dia_es}. NYSE y Europa abiertas."
     if eu_open and not nyse_open: return f"Es {dia_es}. Europa abierta. NYSE abre 15:30 España."
     if not eu_open and nyse_open: return f"Es {dia_es}. NYSE abierta. Europa ya cerró."
-    if hour_utc < 7: return f"Es {dia_es} pre-mercado."
     return f"Es {dia_es}, fuera de horario."
 
 # ═════════════════════════════════════════════════════
-#  SYSTEM PROMPT — DOS MODOS
+#  SYSTEM PROMPTS — TARJETA y CHAT
 # ═════════════════════════════════════════════════════
 def get_system_card():
-    """Modo TARJETA — cuando pide datos de una empresa."""
     hoy = datetime.now().strftime("%d/%m/%Y")
     hora = datetime.now().strftime("%H:%M")
     mercado = market_status_human()
@@ -243,7 +352,7 @@ CUANDO TE PIDA DATOS DE UNA EMPRESA, RESPONDES SIEMPRE CON ESTA TARJETA EXACTA:
 ▪️ Dato 5
 
 Lectura Jarvis:
-[interpretación corta, útil, con criterio. 2-3 frases máximo]
+[interpretación corta, útil. 2-3 frases máximo]
 
 Impacto en tesis:
 [positivo / neutro / negativo]
@@ -264,20 +373,20 @@ Señal:
 7. Frases cortas, verbos fuertes
 8. Visual y limpio para móvil
 
-═══ TÍTULO DE TARJETA ═══
-Cuando es análisis general usa: RESULTADOS, VALORACIÓN, BUSCADOR, CLOUD, AZURE,
-AWS, YOUTUBE, MÁRGENES, CAPEX, REACCIÓN, GUÍA, RPO
+═══ TÍTULOS DE TARJETA ═══
+RESULTADOS, VALORACIÓN, BUSCADOR, CLOUD, AZURE, AWS, YOUTUBE, MÁRGENES,
+CAPEX, REACCIÓN, GUÍA, RPO, MONETIZACIÓN, MOAT
 
 ═══ DATOS ÚTILES PARA BULLETS ═══
 Ventas, EBIT, EPS, Guidance, PER, EV/FCF, valor intrínseco, precio actual,
-reacción mercado, RPO, CapEx, márgenes, ROIC, dividendo, FCF
+reacción mercado, CapEx, márgenes, ROIC, dividendo, FCF, posición en rango 52s
 
 ═══ FRASES PRINCIPALES BUENAS ═══
 - "La IA está acelerando Search, no frenándolo"
-- "Buenos resultados. El ruido viene del CapEx, no del negocio"
 - "El mercado castiga el CapEx, no el negocio"
 - "La tesis sigue intacta"
 - "Margen de seguridad agotado"
+- "Buenos resultados pero cara para entrar"
 
 ═══ VOCABULARIO QUE SÍ ═══
 tesis, refuerza, deteriora, acelera, desacelera, beat, miss, guidance,
@@ -290,35 +399,33 @@ moat, pricing power, ROIC, EV/FCF, margen de seguridad
 
 ═══ DATOS REALES ═══
 Si recibes "DATOS REALES VERIFICADOS FMP" en el mensaje, son del DÍA, ÚSALOS.
-NUNCA inventes números. Si falta uno, di ⚪ NO CONCLUYENTE.
+NUNCA inventes números. Si falta uno, di ⚪ NO CONCLUYENTE en esa parte.
 
-═══ CARTERA REAL DE MIKI (puede haber cambiado) ═══
+═══ CARTERA REAL DE MIKI ═══
 GOOGL +77.4% 17.8% Alta convicción · ZEG +70.8% · JNJ +61.4% · Gold +41.9%
 AAPL +20.6% · CELH +20.9% · SmCap +24.5% · SP500 +24.1% · Europe +23.3%
 TRET +6.9% · SSNC +5.5%
-PERDIENDO: MSFT -12.5% (earnings 29/04) · MONC -3.8% · TXRH -4.1% · India -7.4%
+PERDIENDO: MSFT -12.5% · MONC -3.8% · TXRH -4.1% · India -7.4%
 NUEVA: VISA · VENDIDA: NKE
 """
 
 def get_system_chat():
-    """Modo CONVERSACIÓN — para charlar como colega, sin tarjeta."""
     hoy = datetime.now().strftime("%d/%m/%Y")
     hora = datetime.now().strftime("%H:%M")
     mercado = market_status_human()
-    return f"""Eres JARVIS, el colega de Miki para temas de inversión.
-Ahora estás en modo CONVERSACIÓN. NO uses la tarjeta visual aquí, habla normal.
+    return f"""Eres JARVIS, el colega de Miki para inversión.
+Modo CONVERSACIÓN: NO uses tarjeta visual, habla normal.
 
 Hoy: {hoy} {hora} (España). Mercado: {mercado}
 
 CÓMO HABLAS:
-- Lenguaje COLOQUIAL ESPAÑOL DE ESPAÑA. Como en un bar.
-- Frases cortas, naturales, en voz alta.
+- COLOQUIAL ESPAÑOL DE ESPAÑA. Como en un bar.
+- Frases cortas, naturales.
 - Usa: "joder", "vaya", "pinta bien", "está jodido", "ojo con esto"
 - NUNCA estilo teletipo
-- NUNCA listas con bullets para conversar
-- Cifras dentro de frases
+- NUNCA listas con bullets
 
-Si Miki está agobiado, primero le escuchas como amigo. Luego ayudas.
+Si Miki está agobiado, primero le escuchas. Luego ayudas.
 
 CARTERA: €34.145 +22%. GOOGL +77% (la grande). MSFT -12.5% (vigilar).
 VISA nueva. NKE vendida.
@@ -334,6 +441,10 @@ LONGITUD:
 # ═════════════════════════════════════════════════════
 history = {}
 memory_lock = threading.Lock()
+processed_alert_hashes = set()
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
 
 def _memory_conn():
     conn = sqlite3.connect(Path(MEMORY_DB_PATH))
@@ -358,9 +469,10 @@ def save_memory_local(chat_id, role, content):
         with memory_lock:
             conn = _memory_conn()
             conn.execute("INSERT INTO jarvis_memory_local(chat_id,role,content,created_at) VALUES(?,?,?,?)",
-                (str(chat_id), role, content[:2000], datetime.utcnow().isoformat()))
+                (str(chat_id), role, content[:2000], utc_now()))
             conn.commit(); conn.close()
-    except: pass
+    except Exception as e:
+        logging.error(f"SQLite save: {e}")
 
 def load_memory_local(chat_id, limit=6):
     try:
@@ -380,9 +492,10 @@ def upsert_knowledge(chat_id, key, value):
             conn = _memory_conn()
             conn.execute("DELETE FROM jarvis_knowledge WHERE chat_id=? AND key=?", (str(chat_id), key))
             conn.execute("INSERT INTO jarvis_knowledge(chat_id,key,value,updated_at) VALUES(?,?,?,?)",
-                (str(chat_id), key, value[:2000], datetime.utcnow().isoformat()))
+                (str(chat_id), key, value[:2000], utc_now()))
             conn.commit(); conn.close()
-    except: pass
+    except Exception as e:
+        logging.error(f"Knowledge upsert: {e}")
 
 def list_knowledge(chat_id, limit=8):
     try:
@@ -408,11 +521,11 @@ def persist_movements(movements):
                         (tx_hash,broker,fecha,accion,ticker,importe_eur,asunto,created_at)
                         VALUES(?,?,?,?,?,?,?,?)""",
                         (tx_hash, m.get("broker"), m.get("fecha"), m.get("accion"),
-                         m.get("ticker"), m.get("importe_eur"), m.get("asunto"),
-                         datetime.utcnow().isoformat()))
+                         m.get("ticker"), m.get("importe_eur"), m.get("asunto"), utc_now()))
                     nuevos.append(m)
             conn.commit(); conn.close()
-    except Exception as e: logging.error(f"Persist mov: {e}")
+    except Exception as e:
+        logging.error(f"Persist mov: {e}")
     return nuevos
 
 def recent_transactions(limit=8):
@@ -433,7 +546,7 @@ def save_memory(chat_id, role, content):
             headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
                      "Content-Type": "application/json", "Prefer": "return=minimal"},
             json={"chat_id": str(chat_id), "role": role, "content": content[:1000],
-                  "created_at": datetime.utcnow().isoformat()}, timeout=5)
+                  "created_at": utc_now()}, timeout=5)
     except: pass
 
 def load_memory(chat_id, limit=6):
@@ -451,9 +564,26 @@ def load_memory(chat_id, limit=6):
     return load_memory_local(chat_id, limit=limit)
 
 # ═════════════════════════════════════════════════════
-#  CLAUDE — Llamada con system dinamico
+#  PLANTILLA DE VALORACIÓN
+# ═════════════════════════════════════════════════════
+def load_template():
+    p = Path(TEMPLATE_PATH)
+    if p.exists():
+        try:
+            txt = p.read_text(encoding="utf-8").strip()
+            if txt: return txt
+        except: pass
+    return "Plantilla no encontrada en " + TEMPLATE_PATH
+
+# ═════════════════════════════════════════════════════
+#  CLAUDE — con modo degradado si falta key
 # ═════════════════════════════════════════════════════
 def ask_claude(chat_id, text, system_prompt, web_data="", max_tokens=600):
+    if not ANTHROPIC_KEY:
+        if web_data:
+            return f"Datos disponibles (sin Claude para análisis):\n\n{web_data[:2000]}"
+        return "Sin ANTHROPIC_API_KEY configurada en Render."
+
     mem = load_memory(chat_id, limit=4)
     facts = list_knowledge(chat_id, limit=6)
     txs = recent_transactions(limit=4)
@@ -553,18 +683,24 @@ def typing(chat_id):
     except: pass
 
 # ═════════════════════════════════════════════════════
-#  GMAIL — MyInvestor + Trade Republic + ING (NUEVO)
+#  GMAIL — MyInvestor + Trade Republic + ING
 # ═════════════════════════════════════════════════════
 BROKER_SENDERS = {
-    "myinvestor": ["myinvestor.es", "no-reply@myinvestor.es", "info@myinvestor.es"],
-    "trade_republic": ["traderepublic.com", "no-reply@traderepublic.com", "noreply@traderepublic.com"],
-    "ing": ["ing.es", "info@ing.es", "comunicaciones@ing.es", "noreply@ing.es",
-            "ingdirect.es", "info@ingdirect.es", "alerta@ing.es", "alertas@ing.es"],
+    "myinvestor": ["myinvestor.es", "no-reply@myinvestor.es", "info@myinvestor.es",
+                   "notificaciones@myinvestor.es"],
+    "trade_republic": ["traderepublic.com", "no-reply@traderepublic.com",
+                       "noreply@traderepublic.com", "support@traderepublic.com"],
+    "ing": ["ing.es", "ingdirect.es", "info@ing.es", "info@ingdirect.es",
+            "comunicaciones@ing.es", "noreply@ing.es", "no-reply@ing.es",
+            "alertas@ing.es", "alerta@ing.es", "broker@ing.es",
+            "notificaciones@ing.es", "valores@ing.es"],
 }
 ACTION_KEYWORDS = {
-    "VENTA": ["venta ejecutada", "vendido", "sell executed", "sold", "orden de venta"],
-    "COMPRA": ["compra ejecutada", "comprado", "buy executed", "bought", "orden de compra", "compra de valores"],
-    "DIVIDENDO": ["dividendo", "dividend", "abono de dividendo"],
+    "VENTA": ["venta ejecutada", "vendido", "sell executed", "sold",
+              "orden de venta", "venta de valores"],
+    "COMPRA": ["compra ejecutada", "comprado", "buy executed", "bought",
+               "orden de compra", "compra de valores", "purchase"],
+    "DIVIDENDO": ["dividendo", "dividend", "abono de dividendo", "pago de dividendo"],
     "INGRESO": ["ingreso recibido", "deposit received", "transferencia recibida"],
     "RETIRADA": ["retirada", "withdrawal", "transferencia enviada"],
 }
@@ -672,8 +808,9 @@ def format_movements(movs):
 
 def gmail_monitor_loop():
     if not (GMAIL_USER and GMAIL_APP_PASSWORD and MIKI_CHAT_ID):
-        logging.info("Gmail monitor desactivado")
+        logging.info("Gmail monitor desactivado (faltan vars)")
         return
+    logging.info("Gmail monitor activo - cada 30 min (MyInvestor + Trade Republic + ING)")
     time.sleep(60)
     while True:
         try:
@@ -707,14 +844,19 @@ def autonomous_briefing_loop():
         time.sleep(max(30, AUTONOMY_INTERVAL_MIN) * 60)
 
 # ═════════════════════════════════════════════════════
-#  HANDLER PRINCIPAL — SIN COMANDOS, TODO NATURAL
+#  HANDLER PRINCIPAL
 # ═════════════════════════════════════════════════════
 def handle(chat_id, text):
     txt = text.strip()
     txt_low = txt.lower()
     hoy = datetime.now().strftime("%d/%m/%Y")
 
-    # Memoria permanente: "recuerda que ..."
+    # Comando técnico mínimo
+    if txt_low == "/miid":
+        send(chat_id, f"Tu chat ID es: {chat_id}")
+        return
+
+    # Memoria permanente
     if txt_low.startswith("recuerda que "):
         fact = txt[12:].strip()
         if fact:
@@ -722,10 +864,11 @@ def handle(chat_id, text):
             send(chat_id, "Anotado. Lo tendré en cuenta siempre.")
         return
 
-    # Ver Gmail (broker movements)
+    # Gmail (MyInvestor + Trade Republic + ING)
     gmail_triggers = ["mira mi gmail", "mira gmail", "revisa mi gmail", "revisa gmail",
-                      "ve a gmail", "movimientos", "mi cartera ha cambiado", "actualiza mi cartera",
-                      "cartera ha cambiado", "mira los correos", "revisa los correos"]
+                      "ve a gmail", "movimientos", "mi cartera ha cambiado",
+                      "actualiza mi cartera", "cartera ha cambiado",
+                      "mira los correos", "revisa los correos", "qué movimientos"]
     if any(t in txt_low for t in gmail_triggers):
         typing(chat_id)
         send(chat_id, "Voy a echar un ojo a tu Gmail (MyInvestor + Trade Republic + ING)...")
@@ -736,7 +879,7 @@ def handle(chat_id, text):
 
     # Cartera completa
     cartera_triggers = ["mi cartera", "toda la cartera", "todas las posiciones",
-                        "como está mi cartera", "cómo está mi cartera"]
+                        "cómo está mi cartera", "como está mi cartera", "mis posiciones"]
     if any(t in txt_low for t in cartera_triggers):
         typing(chat_id)
         send(chat_id, "Voy a sacar precios reales de toda la cartera...")
@@ -747,23 +890,23 @@ def handle(chat_id, text):
         send(chat_id, reply)
         return
 
-    # Macro
+    # Macro (sin ticker concreto)
     macro_triggers = ["macro", "fed ", "inflacion", "inflación", "vix", "dolar", "dólar"]
     if any(t in txt_low for t in macro_triggers) and not detect_ticker(txt):
         typing(chat_id)
         web = search_news("FED tipos inflacion VIX dolar mercados hoy", n=3)
-        prompt = f"Cuéntame en lenguaje coloquial cómo está la macro hoy {hoy}."
+        prompt = f"Cuéntame cómo está la macro hoy {hoy} en lenguaje colega."
         reply = ask_claude(chat_id, prompt, get_system_chat(), web_data=web, max_tokens=400)
         send(chat_id, reply)
         audio = tts(reply[:500])
         if audio: send_audio(chat_id, audio)
         return
 
-    # ─── DETECTAR EMPRESA ───
+    # ─── EMPRESA DETECTADA ───
     ticker = detect_ticker(txt)
 
     if ticker:
-        # Si está claramente buscando charla (no datos), responde como colega
+        # Conversacional explícito → responde como colega
         if is_conversational(txt):
             typing(chat_id)
             datos = format_data_for_claude(get_real_data(ticker))
@@ -773,17 +916,32 @@ def handle(chat_id, text):
             if audio: send_audio(chat_id, audio)
             return
 
-        # POR DEFECTO con un ticker → TARJETA VISUAL CON DATOS REALES
+        # Si pide valoración explícita → plantilla exacta
+        if any(p in txt_low for p in ["valora", "valoración", "valoracion", "plantilla",
+                                       "valórame", "valorame", "precio justo"]):
+            typing(chat_id)
+            send(chat_id, f"Dame 10 segundos, te valoro {ticker} con tu plantilla...")
+            datos = format_data_for_claude(get_real_data(ticker))
+            template = load_template()
+            prompt = (f"Valora {ticker} usando EXACTAMENTE esta plantilla en español natural:\n\n"
+                      f"{template}\n\n"
+                      f"REGLAS: Sé directo. No inventes. Si falta dato, dilo explícito. "
+                      f"Cierra con decisión clara para hoy.\n\n{datos}")
+            reply = ask_claude(chat_id, prompt, get_system_chat(), max_tokens=900)
+            send(chat_id, reply)
+            return
+
+        # POR DEFECTO con ticker → TARJETA VISUAL
         typing(chat_id)
         datos = format_data_for_claude(get_real_data(ticker))
-        prompt = (f"Datos reales de {ticker} hoy {hoy}. "
+        prompt = (f"Datos reales de {ticker} hoy {hoy}.\n"
                   f"Pregunta del usuario: \"{txt}\"\n"
                   f"Responde con la tarjeta visual EXACTA según las reglas del sistema.")
         reply = ask_claude(chat_id, prompt, get_system_card(), web_data=datos, max_tokens=600)
         send(chat_id, reply)
         return
 
-    # ─── CONVERSACIÓN GENERAL (sin empresa concreta) ───
+    # ─── CONVERSACIÓN GENERAL ───
     typing(chat_id)
     reply = ask_claude(chat_id, txt, get_system_chat(), max_tokens=500)
     send(chat_id, reply)
@@ -808,11 +966,13 @@ def handle_voice(chat_id, file_id):
 # ═════════════════════════════════════════════════════
 def poll():
     offset = 0
-    logging.info(f"JARVIS v9 - {datetime.now().strftime('%d/%m/%Y %H:%M')}")
-    logging.info(f"FMP:{'OK' if FMP_KEY else 'NO'} | Whisper:{'OK' if OPENAI_KEY else 'NO'} | "
+    logging.info(f"JARVIS v10 - {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    logging.info(f"FMP:{'OK' if FMP_KEY else 'NO'} | "
+                 f"Anthropic:{'OK' if ANTHROPIC_KEY else 'NO'} | "
+                 f"Whisper:{'OK' if OPENAI_KEY else 'NO'} | "
                  f"ElevenLabs:{'OK' if ELEVENLABS_KEY else 'NO'} | "
                  f"Gmail:{'OK' if (GMAIL_USER and GMAIL_APP_PASSWORD) else 'NO'} | "
-                 f"Supabase:{'OK' if SUPABASE_URL else 'NO'}")
+                 f"Supabase:{'OK' if (SUPABASE_URL and SUPABASE_KEY) else 'NO'}")
     while True:
         try:
             r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
@@ -844,7 +1004,7 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self._send_text(200)
-        msg = f"JARVIS v9 - {datetime.now().strftime('%d/%m/%Y %H:%M')} - Online (Tarjeta+ING)"
+        msg = f"JARVIS v10 - {datetime.now().strftime('%d/%m/%Y %H:%M')} - Online"
         self.wfile.write(msg.encode("utf-8"))
 
     def do_HEAD(self):
@@ -860,7 +1020,7 @@ class H(BaseHTTPRequestHandler):
             ticker = detect_ticker(msg)
             if ticker and not is_conversational(msg):
                 datos = format_data_for_claude(get_real_data(ticker))
-                prompt = f"Pregunta usuario: \"{msg}\". Responde con la tarjeta visual."
+                prompt = f"Pregunta: \"{msg}\". Responde con tarjeta visual."
                 reply = ask_claude(chat_id, prompt, get_system_card(), web_data=datos, max_tokens=600)
             else:
                 datos = format_data_for_claude(get_real_data(ticker)) if ticker else ""
@@ -890,7 +1050,12 @@ class H(BaseHTTPRequestHandler):
 # ═════════════════════════════════════════════════════
 #  ARRANQUE
 # ═════════════════════════════════════════════════════
-threading.Thread(target=poll, daemon=True).start()
-threading.Thread(target=gmail_monitor_loop, daemon=True).start()
-threading.Thread(target=autonomous_briefing_loop, daemon=True).start()
-HTTPServer(("0.0.0.0", PORT), H).serve_forever()
+def main():
+    validate_runtime_config()
+    threading.Thread(target=poll, daemon=True).start()
+    threading.Thread(target=gmail_monitor_loop, daemon=True).start()
+    threading.Thread(target=autonomous_briefing_loop, daemon=True).start()
+    HTTPServer(("0.0.0.0", PORT), H).serve_forever()
+
+if __name__ == "__main__":
+    main()
