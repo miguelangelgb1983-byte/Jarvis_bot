@@ -47,6 +47,7 @@ GMAIL_USER         = os.environ.get("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
 MIKI_CHAT_ID       = os.environ.get("MIKI_CHAT_ID")
 FMP_KEY            = os.environ.get("FMP")
+FRED_KEY           = os.environ.get("FRED_KEY")
 PORT               = int(os.environ.get("PORT", 8080))
 MEMORY_DB_PATH     = os.environ.get("MEMORY_DB_PATH", "jarvis_memory.db")
 TEMPLATE_PATH      = os.environ.get("VALUATION_TEMPLATE_PATH", "miki_valuation_template.md")
@@ -68,6 +69,7 @@ def validate_runtime_config():
     optional = {
         "ANTHROPIC_API_KEY": ANTHROPIC_KEY,
         "FMP": FMP_KEY,
+        "FRED_KEY": FRED_KEY,
         "TAVILY_KEY": TAVILY_KEY,
         "OPENAI_API_KEY": OPENAI_KEY,
         "ELEVENLABS_KEY": ELEVENLABS_KEY,
@@ -279,7 +281,7 @@ def _extract_rss_items(xml_text, limit=3):
     return out
 
 def fallback_market_sources(query, n=3):
-    """Fuentes oficiales cuando Tavily falla."""
+    """Fuentes oficiales RSS cuando Tavily falla."""
     feeds = [
         ("FED", "https://www.federalreserve.gov/feeds/press_all.xml"),
         ("SEC", "https://www.sec.gov/news/pressreleases.rss"),
@@ -295,6 +297,172 @@ def fallback_market_sources(query, n=3):
         except: continue
     if not snippets: return ""
     return "Fuentes oficiales:\n" + "\n".join(snippets[:n*2])
+
+# ═════════════════════════════════════════════════════
+#  SEC EDGAR — Filings oficiales (sin key, ilimitado)
+# ═════════════════════════════════════════════════════
+SEC_TICKER_CIK = {}
+
+def sec_get_cik(ticker):
+    ticker_up = ticker.upper()
+    if ticker_up in SEC_TICKER_CIK:
+        return SEC_TICKER_CIK[ticker_up]
+    try:
+        r = requests.get("https://www.sec.gov/files/company_tickers.json",
+                         headers={"User-Agent": "jarvis-miki/1.0 personal"}, timeout=12)
+        if r.status_code != 200: return None
+        for entry in r.json().values():
+            if entry.get("ticker", "").upper() == ticker_up:
+                cik = str(entry["cik_str"]).zfill(10)
+                SEC_TICKER_CIK[ticker_up] = cik
+                return cik
+    except Exception as e:
+        logging.error(f"SEC CIK {ticker}: {e}")
+    return None
+
+def sec_get_filings(ticker, n=5):
+    cik = sec_get_cik(ticker)
+    if not cik: return ""
+    try:
+        r = requests.get(f"https://data.sec.gov/submissions/CIK{cik}.json",
+                         headers={"User-Agent": "jarvis-miki/1.0 personal"}, timeout=12)
+        if r.status_code != 200: return ""
+        recent = r.json().get("filings", {}).get("recent", {})
+        forms = recent.get("form", [])[:n*3]
+        dates = recent.get("filingDate", [])[:n*3]
+        out, count = [], 0
+        for i, form in enumerate(forms):
+            if form in ("10-K", "10-Q", "8-K", "DEF 14A", "4", "20-F"):
+                date = dates[i] if i < len(dates) else "?"
+                out.append(f"  - {form} ({date})")
+                count += 1
+                if count >= n: break
+        if out:
+            return f"SEC EDGAR filings de {ticker} (CIK {cik}):\n" + "\n".join(out)
+    except Exception as e:
+        logging.error(f"SEC filings {ticker}: {e}")
+    return ""
+
+# ═════════════════════════════════════════════════════
+#  OPENINSIDER — Compras/ventas directivos (sin key)
+# ═════════════════════════════════════════════════════
+def openinsider_get(ticker, n=10):
+    try:
+        url = f"http://openinsider.com/screener?s={ticker}&fd=730&xp=1&xs=1&sortcol=0&cnt={n}&page=1"
+        r = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0 jarvis-miki"})
+        if r.status_code != 200: return ""
+        rows = re.findall(r'<tr>(.*?)</tr>', r.text, flags=re.S)
+        out = []
+        for row in rows[1:n+1]:
+            cells = re.findall(r'<td[^>]*>(.*?)</td>', row, flags=re.S)
+            if len(cells) >= 8:
+                clean = [re.sub(r'<[^>]+>', '', c).strip() for c in cells]
+                fecha = clean[1][:10] if len(clean) > 1 else "?"
+                cargo = clean[5][:30] if len(clean) > 5 else "?"
+                tipo = clean[6] if len(clean) > 6 else "?"
+                qty = clean[8] if len(clean) > 8 else "?"
+                price = clean[7] if len(clean) > 7 else "?"
+                if tipo and qty:
+                    out.append(f"  - {fecha} | {cargo} | {tipo} | {qty} @ {price}")
+        if out:
+            return f"INSIDERS {ticker} (últimos {len(out)}):\n" + "\n".join(out[:n])
+    except Exception as e:
+        logging.error(f"OpenInsider {ticker}: {e}")
+    return ""
+
+# ═════════════════════════════════════════════════════
+#  FRED — Macro USA con API key
+# ═════════════════════════════════════════════════════
+FRED_SERIES = {
+    "DFF": "Federal Funds Rate",
+    "CPIAUCSL": "CPI inflación USA",
+    "UNRATE": "Tasa de paro USA",
+    "DGS10": "Bono 10 años USA",
+    "VIXCLS": "VIX volatilidad",
+    "DTWEXBGS": "Índice dólar",
+}
+
+def fred_get(series_id):
+    if not FRED_KEY: return None
+    try:
+        r = requests.get("https://api.stlouisfed.org/fred/series/observations",
+            params={"series_id": series_id, "api_key": FRED_KEY,
+                    "file_type": "json", "sort_order": "desc", "limit": 1},
+            timeout=10)
+        if r.status_code == 200:
+            obs = r.json().get("observations", [])
+            if obs and obs[0].get("value") not in (".", None):
+                return {"value": obs[0]["value"], "date": obs[0]["date"]}
+    except Exception as e:
+        logging.error(f"FRED {series_id}: {e}")
+    return None
+
+def fred_macro_snapshot():
+    if not FRED_KEY: return ""
+    out = ["MACRO USA (FRED oficial):"]
+    for sid, label in FRED_SERIES.items():
+        d = fred_get(sid)
+        if d:
+            out.append(f"  - {label}: {d['value']} ({d['date']})")
+    return "\n".join(out) if len(out) > 1 else ""
+
+# ═════════════════════════════════════════════════════
+#  ECB — Macro Europa (sin key)
+# ═════════════════════════════════════════════════════
+def ecb_macro_snapshot():
+    series = {
+        "FM.B.U2.EUR.4F.KR.DFR.LEV": "Tipo depósito BCE",
+        "FM.B.U2.EUR.4F.KR.MRR_FR.LEV": "Tipo refinanciación BCE",
+    }
+    out = ["MACRO EUROPA (ECB oficial):"]
+    for sid, label in series.items():
+        try:
+            r = requests.get(f"https://data-api.ecb.europa.eu/service/data/{sid}",
+                params={"format": "jsondata", "lastNObservations": "1"},
+                headers={"Accept": "application/json"}, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                obs_dict = data.get("dataSets", [{}])[0].get("series", {})
+                for val in obs_dict.values():
+                    obs_data = val.get("observations", {})
+                    if obs_data:
+                        last_val = list(obs_data.values())[0][0]
+                        out.append(f"  - {label}: {last_val}")
+                        break
+        except Exception as e:
+            logging.error(f"ECB {sid}: {e}")
+    return "\n".join(out) if len(out) > 1 else ""
+
+# ═════════════════════════════════════════════════════
+#  iShares — Holdings ETFs oficiales
+# ═════════════════════════════════════════════════════
+def ishares_top_holdings(etf_ticker, n=10):
+    urls = {
+        "IVV": "https://www.ishares.com/us/products/239726/ishares-core-sp-500-etf/1467271812596.ajax?fileType=json&fileName=IVV_holdings",
+        "INDA": "https://www.ishares.com/us/products/239755/ishares-msci-india-etf/1467271812596.ajax?fileType=json&fileName=INDA_holdings",
+    }
+    url = urls.get(etf_ticker.upper())
+    if not url: return ""
+    try:
+        r = requests.get(url, timeout=15, headers={"User-Agent": "jarvis-miki/1.0"})
+        if r.status_code != 200: return ""
+        text = r.text.lstrip('\ufeff')
+        data = json.loads(text)
+        rows = data.get("aaData", [])[:n]
+        out = [f"TOP {n} HOLDINGS de {etf_ticker} (iShares oficial):"]
+        for row in rows:
+            try:
+                ticker_h = row[0] if len(row) > 0 else "?"
+                name = (row[1] if len(row) > 1 else "?")[:40]
+                weight = row[5] if len(row) > 5 else "?"
+                if isinstance(weight, dict):
+                    weight = weight.get("display", "?")
+                out.append(f"  - {ticker_h} {name}: {weight}")
+            except: continue
+        return "\n".join(out) if len(out) > 1 else ""
+    except Exception as e:
+        logging.error(f"iShares {etf_ticker}: {e}")
+    return ""
 
 def search_news(query, n=2):
     if not TAVILY_KEY:
@@ -900,17 +1068,60 @@ def handle(chat_id, text):
         send(chat_id, reply)
         return
 
-    # Macro (sin ticker concreto)
-    macro_triggers = ["macro", "fed ", "inflacion", "inflación", "vix", "dolar", "dólar"]
+    # Macro (sin ticker concreto) - AHORA con FRED + ECB en directo
+    macro_triggers = ["macro", "fed ", "inflacion", "inflación", "vix", "dolar", "dólar",
+                      "tipos de interés", "tipos de interes", "bce", "ecb"]
     if any(t in txt_low for t in macro_triggers) and not detect_ticker(txt):
         typing(chat_id)
-        web = search_news("FED tipos inflacion VIX dolar mercados hoy", n=3)
-        prompt = f"Cuéntame cómo está la macro hoy {hoy} en lenguaje colega."
-        reply = ask_claude(chat_id, prompt, get_system_chat(), web_data=web, max_tokens=400)
+        send(chat_id, "Sacando datos macro oficiales (FED + BCE)...")
+        fred_data = fred_macro_snapshot()
+        ecb_data = ecb_macro_snapshot()
+        news = search_news("FED tipos inflacion VIX dolar mercados hoy", n=2)
+        macro_full = f"{fred_data}\n\n{ecb_data}\n\nNoticias:\n{news}"
+        prompt = f"Cuéntame cómo está la macro hoy {hoy} en lenguaje colega. Usa los datos oficiales."
+        reply = ask_claude(chat_id, prompt, get_system_chat(), web_data=macro_full, max_tokens=500)
         send(chat_id, reply)
         audio = tts(reply[:500])
         if audio: send_audio(chat_id, audio)
         return
+
+    # Insiders (con o sin ticker)
+    insider_triggers = ["insider", "insiders", "directivos", "compras de directivos",
+                        "ventas de directivos", "compra interna", "venta interna"]
+    if any(t in txt_low for t in insider_triggers):
+        ticker_ins = detect_ticker(txt)
+        if ticker_ins:
+            typing(chat_id)
+            send(chat_id, f"Mirando insiders de {ticker_ins} en OpenInsider...")
+            ins_data = openinsider_get(ticker_ins, n=10)
+            if not ins_data:
+                send(chat_id, f"No he encontrado datos de insiders recientes para {ticker_ins}.")
+                return
+            prompt = (f"Resume estos movimientos de insiders de {ticker_ins} para Miki. "
+                      f"Tono colega. Si hay compras del CEO/CFO/Insider Chairman, marca eso. "
+                      f"Si solo hay ventas planeadas (10b5-1) avísalo.")
+            reply = ask_claude(chat_id, prompt, get_system_chat(), web_data=ins_data, max_tokens=500)
+            send(chat_id, reply)
+            return
+        else:
+            send(chat_id, "Dime de qué empresa quieres ver insiders, ej: \"insiders MSFT\"")
+            return
+
+    # Holdings ETF
+    holdings_triggers = ["holdings", "qué hay en", "que hay en", "componentes de",
+                         "top del", "principales del"]
+    etf_keywords = {"sp500": "IVV", "ivv": "IVV", "india": "INDA", "inda": "INDA"}
+    if any(t in txt_low for t in holdings_triggers):
+        for kw, etf in etf_keywords.items():
+            if kw in txt_low:
+                typing(chat_id)
+                send(chat_id, f"Pidiendo holdings oficiales de {etf} a iShares...")
+                h = ishares_top_holdings(etf, n=10)
+                if h:
+                    send(chat_id, h)
+                else:
+                    send(chat_id, f"No he podido sacar los holdings de {etf} ahora mismo.")
+                return
 
     # ─── EMPRESA DETECTADA ───
     ticker = detect_ticker(txt)
@@ -926,18 +1137,25 @@ def handle(chat_id, text):
             if audio: send_audio(chat_id, audio)
             return
 
-        # Si pide valoración explícita → plantilla exacta
+        # Si pide valoración explícita → plantilla EXACTA + SEC + INSIDERS para profundidad
         if any(p in txt_low for p in ["valora", "valoración", "valoracion", "plantilla",
-                                       "valórame", "valorame", "precio justo"]):
+                                       "valórame", "valorame", "precio justo",
+                                       "valor intrínseco", "valor intrinseco"]):
             typing(chat_id)
-            send(chat_id, f"Dame 10 segundos, te valoro {ticker} con tu plantilla...")
-            datos = format_data_for_claude(get_real_data(ticker))
+            send(chat_id, f"Dame 15 segundos, te hago la valoración profunda de {ticker} cruzando "
+                          f"FMP + SEC EDGAR + OpenInsider...")
+            fmp_data = format_data_for_claude(get_real_data(ticker))
+            sec_data = sec_get_filings(ticker, n=5)
+            ins_data = openinsider_get(ticker, n=5)
+            full_data = f"{fmp_data}\n\n{sec_data}\n\n{ins_data}"
             template = load_template()
-            prompt = (f"Valora {ticker} usando EXACTAMENTE esta plantilla en español natural:\n\n"
+            prompt = (f"Valora {ticker} usando EXACTAMENTE esta plantilla en español natural. "
+                      f"Cruza datos FMP + SEC + insiders para que sea a prueba de bombas:\n\n"
                       f"{template}\n\n"
                       f"REGLAS: Sé directo. No inventes. Si falta dato, dilo explícito. "
-                      f"Cierra con decisión clara para hoy.\n\n{datos}")
-            reply = ask_claude(chat_id, prompt, get_system_chat(), max_tokens=900)
+                      f"Si hay insiders comprando o vendiendo recientemente, méntalo en RIESGOS o TESIS. "
+                      f"Cierra con decisión clara para hoy.\n\n{full_data}")
+            reply = ask_claude(chat_id, prompt, get_system_chat(), max_tokens=1100)
             send(chat_id, reply)
             return
 
