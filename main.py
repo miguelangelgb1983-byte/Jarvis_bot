@@ -133,70 +133,80 @@ def is_conversational(text):
     return any(p in txt_low for p in CONVERSATIONAL_KEYWORDS)
 
 # ═════════════════════════════════════════════════════
-#  FMP — Precios reales con reintentos
+#  FMP — Endpoints /stable/ (los nuevos, post-agosto 2025)
 # ═════════════════════════════════════════════════════
-def fmp_get(endpoint, ticker, retries=2):
+def fmp_get_stable(endpoint, symbol, retries=2):
+    """Endpoints nuevos /stable/ con symbol como query param."""
     if not FMP_KEY: return None
     for attempt in range(retries + 1):
         try:
-            r = requests.get(f"https://financialmodelingprep.com/api/v3/{endpoint}/{ticker}",
-                             params={"apikey": FMP_KEY}, timeout=12)
+            r = requests.get(f"https://financialmodelingprep.com/stable/{endpoint}",
+                             params={"symbol": symbol, "apikey": FMP_KEY}, timeout=12)
             if r.status_code == 200:
                 data = r.json()
                 if isinstance(data, list) and data:
                     return data[0]
+                if isinstance(data, dict) and data:
+                    return data
                 return None
             elif r.status_code == 429:
-                logging.warning(f"FMP rate limit en {endpoint} {ticker}")
+                logging.warning(f"FMP rate limit en {endpoint} {symbol}")
                 if attempt < retries:
                     time.sleep(2)
                     continue
                 return None
         except Exception as e:
-            logging.error(f"FMP {endpoint} {ticker} attempt {attempt}: {e}")
+            logging.error(f"FMP {endpoint} {symbol} attempt {attempt}: {e}")
             if attempt < retries:
                 time.sleep(1)
                 continue
     return None
 
 def get_real_data(ticker_input):
-    """Datos reales verificados estructurados."""
+    """Datos reales verificados estructurados desde FMP /stable/."""
     ticker_up = ticker_input.upper()
     if ticker_up in EUROPEAN_TICKERS:
         return {"is_european": True, "ticker": ticker_up,
                 "tavily": search_news(f"{ticker_input} stock price PER FCF today", n=3)}
 
     fmp_ticker = FMP_TICKERS.get(ticker_up, ticker_up)
-    quote = fmp_get("quote", fmp_ticker)
+    quote = fmp_get_stable("quote", fmp_ticker)
     if not quote:
-        return {"error": f"FMP no devolvió datos para {ticker_input} (puede ser rate limit o ticker no soportado)"}
+        return {"error": f"FMP no devolvió datos para {ticker_input}"}
 
-    ratios = fmp_get("ratios-ttm", fmp_ticker) or {}
-    metrics = fmp_get("key-metrics-ttm", fmp_ticker) or {}
-    profile = fmp_get("profile", fmp_ticker) or {}
+    ratios = fmp_get_stable("ratios-ttm", fmp_ticker) or {}
+    metrics = fmp_get_stable("key-metrics-ttm", fmp_ticker) or {}
+    profile = fmp_get_stable("profile", fmp_ticker) or {}
+
+    # Soportar nombres en español (la API responde a veces traducido)
+    def g(d, *keys):
+        for k in keys:
+            v = d.get(k)
+            if v is not None: return v
+        return None
 
     return {
         "ticker": fmp_ticker,
-        "name": quote.get("name") or profile.get("companyName") or ticker_up,
-        "price": quote.get("price"),
-        "change_pct": quote.get("changesPercentage"),
-        "previous_close": quote.get("previousClose"),
-        "pe": quote.get("pe") or ratios.get("priceEarningsRatioTTM"),
-        "pe_forward": ratios.get("priceEarningsToGrowthRatioTTM"),
-        "eps": quote.get("eps"),
-        "market_cap": quote.get("marketCap"),
-        "year_high": quote.get("yearHigh"),
-        "year_low": quote.get("yearLow"),
-        "roe": ratios.get("returnOnEquityTTM"),
-        "roic": metrics.get("roicTTM"),
-        "op_margin": ratios.get("operatingProfitMarginTTM"),
-        "fcf_per_share": metrics.get("freeCashFlowPerShareTTM"),
-        "ev_ebitda": metrics.get("enterpriseValueOverEBITDATTM"),
-        "debt_equity": ratios.get("debtEquityRatioTTM") or ratios.get("debtToEquityTTM"),
-        "dividend_yield": quote.get("dividendYield"),
-        "sector": profile.get("sector"),
-        "industry": profile.get("industry"),
-        "currency": profile.get("currency", "USD"),
+        "name": g(quote, "name", "nombre") or g(profile, "companyName", "nombre") or ticker_up,
+        "price": g(quote, "price", "precio"),
+        "change_pct": g(quote, "changesPercentage", "cambioPorcentaje"),
+        "previous_close": g(quote, "previousClose"),
+        "pe": g(quote, "pe") or g(ratios, "priceEarningsRatioTTM", "peRatioTTM"),
+        "pe_forward": g(ratios, "forwardPE", "priceEarningsToGrowthRatioTTM"),
+        "eps": g(quote, "eps"),
+        "market_cap": g(quote, "marketCap"),
+        "year_high": g(quote, "yearHigh"),
+        "year_low": g(quote, "yearLow"),
+        "roe": g(ratios, "returnOnEquityTTM"),
+        "roic": g(metrics, "roicTTM", "returnOnInvestedCapitalTTM"),
+        "op_margin": g(ratios, "operatingProfitMarginTTM"),
+        "fcf_per_share": g(metrics, "freeCashFlowPerShareTTM"),
+        "ev_ebitda": g(metrics, "enterpriseValueOverEBITDATTM"),
+        "debt_equity": g(ratios, "debtEquityRatioTTM", "debtToEquityTTM"),
+        "dividend_yield": g(quote, "dividendYield"),
+        "sector": g(profile, "sector"),
+        "industry": g(profile, "industry"),
+        "currency": g(profile, "currency") or "USD",
     }
 
 def format_data_for_claude(data):
