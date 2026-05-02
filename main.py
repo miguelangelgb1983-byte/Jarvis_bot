@@ -138,7 +138,7 @@ def is_conversational(text):
 #  FMP — Endpoints /stable/ (los nuevos, post-agosto 2025)
 # ═════════════════════════════════════════════════════
 def fmp_get_stable(endpoint, symbol, retries=2):
-    """Endpoints nuevos /stable/ con symbol como query param."""
+    """Endpoints /stable/. Devuelve dict normal, o {"_premium": True} si FMP free no cubre."""
     if not FMP_KEY: return None
     for attempt in range(retries + 1):
         try:
@@ -146,11 +146,20 @@ def fmp_get_stable(endpoint, symbol, retries=2):
                              params={"symbol": symbol, "apikey": FMP_KEY}, timeout=12)
             if r.status_code == 200:
                 data = r.json()
-                if isinstance(data, list) and data:
-                    return data[0]
-                if isinstance(data, dict) and data:
-                    return data
+                # Detectar respuesta Premium de FMP
+                if isinstance(data, dict):
+                    em = (data.get("Error Message") or data.get("error") or "").lower()
+                    if "premium" in em or "subscription" in em or "not available under your current" in em:
+                        logging.info(f"FMP Premium para {symbol} en {endpoint} → fallback")
+                        return {"_premium": True}
+                    if data: return data
+                if isinstance(data, list):
+                    if data: return data[0]
+                    return None
                 return None
+            elif r.status_code == 402:
+                # Payment Required = Premium
+                return {"_premium": True}
             elif r.status_code == 429:
                 logging.warning(f"FMP rate limit en {endpoint} {symbol}")
                 if attempt < retries:
@@ -165,7 +174,7 @@ def fmp_get_stable(endpoint, symbol, retries=2):
     return None
 
 def get_real_data(ticker_input):
-    """Datos reales verificados estructurados desde FMP /stable/."""
+    """Datos reales. Si FMP free no cubre el ticker, fallback automático Tavily+SEC."""
     ticker_up = ticker_input.upper()
     if ticker_up in EUROPEAN_TICKERS:
         return {"is_european": True, "ticker": ticker_up,
@@ -173,14 +182,33 @@ def get_real_data(ticker_input):
 
     fmp_ticker = FMP_TICKERS.get(ticker_up, ticker_up)
     quote = fmp_get_stable("quote", fmp_ticker)
+
+    # FMP free no cubre este ticker → fallback automático
+    if quote and isinstance(quote, dict) and quote.get("_premium"):
+        logging.info(f"FMP free no cubre {ticker_input} → Tavily + SEC EDGAR")
+        sec = sec_get_filings(ticker_input, n=3)
+        ins = openinsider_get(ticker_input, n=5)
+        news = search_news(f"{ticker_input} stock price PER FCF EPS revenue today", n=4)
+        return {"_fallback": True, "ticker": ticker_up, "name": ticker_up,
+                "tavily": news, "sec": sec, "insiders": ins}
+
     if not quote:
-        return {"error": f"FMP no devolvió datos para {ticker_input}"}
+        # FMP cayó del todo, intentar Tavily como último recurso
+        news = search_news(f"{ticker_input} stock price market cap PER today", n=3)
+        if news:
+            return {"_fallback": True, "ticker": ticker_up, "name": ticker_up,
+                    "tavily": news, "sec": "", "insiders": ""}
+        return {"error": f"Sin datos para {ticker_input} (FMP no devolvió nada)"}
 
     ratios = fmp_get_stable("ratios-ttm", fmp_ticker) or {}
     metrics = fmp_get_stable("key-metrics-ttm", fmp_ticker) or {}
     profile = fmp_get_stable("profile", fmp_ticker) or {}
 
-    # Soportar nombres en español (la API responde a veces traducido)
+    # Si los demás dieron premium, los ignoramos
+    if ratios.get("_premium"): ratios = {}
+    if metrics.get("_premium"): metrics = {}
+    if profile.get("_premium"): profile = {}
+
     def g(d, *keys):
         for k in keys:
             v = d.get(k)
@@ -216,6 +244,16 @@ def format_data_for_claude(data):
     if data.get("error"): return f"DATOS NO DISPONIBLES: {data['error']}"
     if data.get("is_european"):
         return f"DATOS EUROPEO {data['ticker']} via Tavily:\n{data.get('tavily','')}"
+    if data.get("_fallback"):
+        # Small-cap o no cubierto en FMP free → datos de Tavily + SEC + insiders
+        parts = [f"DATOS DE {data['ticker']} (FMP free no lo cubre — fuentes alternativas):"]
+        if data.get("tavily"):
+            parts.append(f"\nNOTICIAS Y DATOS WEB:\n{data['tavily']}")
+        if data.get("sec"):
+            parts.append(f"\n{data['sec']}")
+        if data.get("insiders"):
+            parts.append(f"\n{data['insiders']}")
+        return "\n".join(parts)
 
     lines = [f"DATOS REALES VERIFICADOS FMP ({datetime.now().strftime('%d/%m/%Y %H:%M')}):"]
     lines.append(f"Empresa: {data.get('name')} ({data.get('ticker')})")
@@ -596,7 +634,18 @@ Modo CONVERSACIÓN: NO uses tarjeta visual, habla normal.
 
 Hoy: {hoy} {hora} (España). Mercado: {mercado}
 
-CÓMO HABLAS:
+═══ TU SUPER CEREBRO ═══
+Tienes integrado DEXTER, tu motor de research profundo. Funciona en 4 pasos:
+1) PLANNING: planificas qué fuentes usar
+2) EXECUTION: cruzas FMP + SEC EDGAR + OpenInsider + FRED + ECB + Tavily
+3) REFLECTION: detectas huecos y contradicciones
+4) ANSWER: rellenas la PLANTILLA EXACTA DE MIKI con datos verificados
+
+CUANDO Miki pide CUALQUIER valoración → ya se activa Dexter automáticamente.
+TU OBLIGACIÓN cuando llegue resultado de Dexter: SIEMPRE usar la plantilla EXACTA, las 9 secciones,
+sin saltarte ninguna, sin inventar datos, sin pegote literario.
+
+═══ CÓMO HABLAS (modo conversación) ═══
 - COLOQUIAL ESPAÑOL DE ESPAÑA. Como en un bar.
 - Frases cortas, naturales.
 - Usa: "joder", "vaya", "pinta bien", "está jodido", "ojo con esto"
@@ -605,13 +654,36 @@ CÓMO HABLAS:
 
 Si Miki está agobiado, primero le escuchas. Luego ayudas.
 
-CARTERA: €34.145 +22%. GOOGL +77% (la grande). MSFT -12.5% (vigilar).
+═══ FUENTES DE DATOS (REALES, NO INVENTAR) ═══
+- FMP /stable/: precio, PER, ROE, ROIC, FCF, market cap (si FMP free no cubre, hay fallback)
+- SEC EDGAR: 10-K, 10-Q, 8-K, Forms 4 (insiders) - sin límite, oficial
+- OpenInsider: compras/ventas directivos
+- FRED: macro USA (FED, CPI, paro, bono 10y, VIX, dólar)
+- ECB: macro Europa (tipos depósito BCE, refinanciación)
+- iShares: holdings oficiales SP500 e India
+- Tavily: noticias actuales + fallback small caps
+
+═══ PLANTILLA DE VALORACIÓN ═══
+Tienes cargada la PLANTILLA EXACTA de "Invertir Desde 0" (9 secciones obligatorias):
+1) Tesis (3 líneas)
+2) Datos base (precio, market cap, sector)
+3) Calidad (ROE, margen, deuda, FCF)
+4) Crecimiento y ejecución
+5) Valoración con FÓRMULAS (rango 52s, FCF Yield, De-rating PER)
+6) Precio justo (3 escenarios + margen seguridad)
+7) Riesgos (máx 3)
+8) Decisión operativa (acción, zona, tamaño, invalidación)
+9) Convicción 0-10 + frase final
+
+═══ CARTERA ACTUAL ═══
+€34.145 +22%. GOOGL +77% (la grande). MSFT -12.5% (vigilar).
 VISA nueva. NKE vendida.
 
-LONGITUD:
+═══ LONGITUD POR DEFECTO ═══
 - Saludo: 1-2 frases
 - Pregunta puntual: 2-4 frases
 - Conversación: 3-6 frases máximo
+- Resultado Dexter / valoración: las 9 secciones de la plantilla SIN RECORTAR
 """
 
 # ═════════════════════════════════════════════════════
@@ -811,8 +883,105 @@ def ask_claude(chat_id, text, system_prompt, web_data="", max_tokens=600):
         return "Sin conexión con la API. Pruébalo en 30 segundos."
 
 # ═════════════════════════════════════════════════════
-#  ELEVENLABS + WHISPER
+#  DEXTER-STYLE — Planning + Execution + Reflection
+#  Inspirado en https://github.com/virattt/dexter
+#  Versión Python integrada en Jarvis (no requiere instalación)
 # ═════════════════════════════════════════════════════
+def claude_call(system_prompt, user_text, max_tokens=600):
+    """Llamada simple a Claude sin memoria (para planificación interna)."""
+    if not ANTHROPIC_KEY: return None
+    try:
+        r = requests.post("https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json={"model": "claude-sonnet-4-20250514", "max_tokens": max_tokens,
+                  "system": system_prompt, "messages": [{"role": "user", "content": user_text}]},
+            timeout=45)
+        data = r.json()
+        if "error" in data: return None
+        return data["content"][0]["text"]
+    except Exception as e:
+        logging.error(f"Dexter Claude: {e}")
+        return None
+
+def dexter_research(chat_id, ticker, user_question):
+    """
+    Filosofía Dexter:
+    1) PLANNING: Claude diseña un plan de research específico
+    2) EXECUTION: ejecuta TODAS las fuentes disponibles para ese ticker
+    3) REFLECTION: revisa los datos y detecta huecos
+    4) ANSWER: respuesta final con plantilla EXACTA de Miki
+    """
+    log_step = lambda s: logging.info(f"[DEXTER {ticker}] {s}")
+
+    # ─── PASO 1: PLANNING ───
+    plan_prompt = (
+        f"Eres un planner de research financiero. El usuario pregunta:\n\"{user_question}\"\n"
+        f"Sobre el ticker: {ticker}\n\n"
+        f"Tienes estas fuentes disponibles:\n"
+        f"- FMP /stable/ (precio, PER, ROE, ROIC, market cap, FCF)\n"
+        f"- SEC EDGAR (10-K, 10-Q, 8-K, Forms 4 insiders)\n"
+        f"- OpenInsider (compras/ventas insiders detalladas)\n"
+        f"- FRED (macro USA: tipos, inflación, paro, bono 10y)\n"
+        f"- ECB (macro Europa)\n"
+        f"- Tavily (noticias web actuales)\n\n"
+        f"Diseña un plan de research de máximo 4 pasos. Cada paso UNA línea. "
+        f"Incluye CRUZAR datos de al menos 3 fuentes. No te enrolles, solo el plan."
+    )
+    plan = claude_call(
+        "Eres un planner financiero conciso, en español de España.",
+        plan_prompt, max_tokens=300
+    )
+    log_step(f"Plan: {plan[:200] if plan else 'NULO'}")
+
+    # ─── PASO 2: EXECUTION ───
+    log_step("Ejecutando fuentes...")
+    fmp_data = format_data_for_claude(get_real_data(ticker))
+    sec_data = sec_get_filings(ticker, n=5)
+    ins_data = openinsider_get(ticker, n=8)
+    news_data = search_news(f"{ticker} earnings revenue guidance latest", n=4)
+    macro_data = fred_macro_snapshot() if FRED_KEY else ""
+
+    full_data = (
+        f"=== FMP ===\n{fmp_data}\n\n"
+        f"=== SEC EDGAR ===\n{sec_data or 'sin filings recientes'}\n\n"
+        f"=== INSIDERS (OpenInsider) ===\n{ins_data or 'sin movimientos detectados'}\n\n"
+        f"=== NOTICIAS (Tavily) ===\n{news_data or 'sin noticias'}\n\n"
+        f"=== MACRO USA (FRED) ===\n{macro_data or 'macro no disponible'}"
+    )
+
+    # ─── PASO 3: REFLECTION ───
+    reflect_prompt = (
+        f"Eres un crítico financiero. Mira estos datos recopilados de {ticker}:\n\n"
+        f"{full_data}\n\n"
+        f"Identifica en máximo 3 líneas:\n"
+        f"1. ¿Qué dato CRÍTICO falta para una valoración seria?\n"
+        f"2. ¿Hay alguna contradicción entre fuentes?\n"
+        f"3. ¿Hay algún red flag urgente?\n"
+        f"Sé directo, español natural."
+    )
+    reflection = claude_call(
+        "Eres un revisor financiero brutalmente honesto.",
+        reflect_prompt, max_tokens=300
+    )
+    log_step(f"Reflection: {reflection[:200] if reflection else 'NULO'}")
+
+    # ─── PASO 4: FINAL con plantilla EXACTA ───
+    template = load_template()
+    final_prompt = (
+        f"Pregunta del usuario: \"{user_question}\"\n"
+        f"Ticker: {ticker}\n"
+        f"Hoy: {datetime.now().strftime('%d/%m/%Y')}\n\n"
+        f"PLAN DE RESEARCH SEGUIDO:\n{plan or '(plan no generado)'}\n\n"
+        f"DATOS RECOPILADOS:\n{full_data}\n\n"
+        f"REFLEXIÓN CRÍTICA:\n{reflection or '(sin reflexión)'}\n\n"
+        f"AHORA: rellena ESTA plantilla EXACTA con los datos reales (no inventes):\n\n{template}\n\n"
+        f"Si un dato no existe, escribe 'NO DISPONIBLE' en esa línea pero sigue rellenando el resto. "
+        f"Cierra con la decisión clara y la convicción 0-10."
+    )
+    return ask_claude(chat_id, final_prompt, get_system_chat(), max_tokens=1300)
+
+
 def tts(text):
     if not ELEVENLABS_KEY: return None
     try:
@@ -1137,25 +1306,31 @@ def handle(chat_id, text):
             if audio: send_audio(chat_id, audio)
             return
 
-        # Si pide valoración explícita → plantilla EXACTA + SEC + INSIDERS para profundidad
-        if any(p in txt_low for p in ["valora", "valoración", "valoracion", "plantilla",
-                                       "valórame", "valorame", "precio justo",
-                                       "valor intrínseco", "valor intrinseco"]):
+        # ─── DEXTER RESEARCH (super cerebro de Jarvis) ───
+        # Se activa con CUALQUIER intención de análisis profundo o valoración
+        DEXTER_TRIGGERS = [
+            # Valoración explícita
+            "valora", "valoración", "valoracion", "valórame", "valorame",
+            "valuar", "evaluar", "evalúa", "evalua",
+            # Plantilla
+            "plantilla", "invertir desde 0", "invertir desde cero",
+            # Precio justo / valor intrínseco
+            "precio justo", "valor intrínseco", "valor intrinseco",
+            "precio objetivo", "precio target",
+            # Análisis profundo
+            "análisis profundo", "analisis profundo", "análisis completo",
+            "analisis completo", "research", "investiga", "estudia",
+            "tesis", "tesis de inversión", "deep dive",
+            # Decisión
+            "compro o no", "vendo o no", "qué hago con", "que hago con",
+            "merece la pena", "vale la pena",
+        ]
+        if any(p in txt_low for p in DEXTER_TRIGGERS):
             typing(chat_id)
-            send(chat_id, f"Dame 15 segundos, te hago la valoración profunda de {ticker} cruzando "
-                          f"FMP + SEC EDGAR + OpenInsider...")
-            fmp_data = format_data_for_claude(get_real_data(ticker))
-            sec_data = sec_get_filings(ticker, n=5)
-            ins_data = openinsider_get(ticker, n=5)
-            full_data = f"{fmp_data}\n\n{sec_data}\n\n{ins_data}"
-            template = load_template()
-            prompt = (f"Valora {ticker} usando EXACTAMENTE esta plantilla en español natural. "
-                      f"Cruza datos FMP + SEC + insiders para que sea a prueba de bombas:\n\n"
-                      f"{template}\n\n"
-                      f"REGLAS: Sé directo. No inventes. Si falta dato, dilo explícito. "
-                      f"Si hay insiders comprando o vendiendo recientemente, méntalo en RIESGOS o TESIS. "
-                      f"Cierra con decisión clara para hoy.\n\n{full_data}")
-            reply = ask_claude(chat_id, prompt, get_system_chat(), max_tokens=1100)
+            send(chat_id, f"🧠 Activando DEXTER (super cerebro) para {ticker}...\n"
+                          f"Plan → Datos (FMP+SEC+Insiders+News+Macro) → Reflexión → Plantilla EXACTA.\n"
+                          f"30-45 segundos.")
+            reply = dexter_research(chat_id, ticker, txt)
             send(chat_id, reply)
             return
 
@@ -1190,11 +1365,145 @@ def handle_voice(chat_id, file_id):
     handle(chat_id, text)
 
 # ═════════════════════════════════════════════════════
+#  IMÁGENES — Claude Vision (híbrido: con o sin caption)
+# ═════════════════════════════════════════════════════
+import base64
+
+def download_telegram_file(file_id):
+    """Descarga un archivo de Telegram y devuelve los bytes."""
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile",
+                         params={"file_id": file_id}, timeout=10)
+        if r.status_code != 200: return None, None
+        file_path = r.json()["result"]["file_path"]
+        ext = file_path.split(".")[-1].lower()
+        media_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+                      "png": "image/png", "webp": "image/webp",
+                      "gif": "image/gif"}.get(ext, "image/jpeg")
+        url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+        img = requests.get(url, timeout=30).content
+        return img, media_type
+    except Exception as e:
+        logging.error(f"Telegram getFile: {e}")
+        return None, None
+
+def ask_claude_vision(chat_id, image_bytes, media_type, user_text, system_prompt, max_tokens=900):
+    """Llama a Claude con imagen + texto."""
+    if not ANTHROPIC_KEY:
+        return "Sin ANTHROPIC_API_KEY no puedo analizar imágenes."
+    try:
+        b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+        msgs = [{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64",
+                                              "media_type": media_type, "data": b64}},
+                {"type": "text", "text": user_text}
+            ]
+        }]
+        r = requests.post("https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json={"model": "claude-sonnet-4-20250514", "max_tokens": max_tokens,
+                  "system": system_prompt, "messages": msgs}, timeout=60)
+        data = r.json()
+        if "error" in data:
+            return f"Error Claude Vision: {data['error'].get('message','')[:120]}"
+        reply = data["content"][0]["text"]
+        save_memory(chat_id, "user", f"[IMAGEN] {user_text[:300]}")
+        save_memory(chat_id, "assistant", reply[:600])
+        return reply
+    except Exception as e:
+        logging.error(f"Vision: {e}")
+        return "No he podido procesar la imagen ahora mismo."
+
+def handle_image(chat_id, file_id, caption=""):
+    """Procesa imagen con o sin caption (híbrido A+B+C)."""
+    typing(chat_id)
+    img, media_type = download_telegram_file(file_id)
+    if not img:
+        send(chat_id, "No he podido descargar la imagen, prueba de nuevo.")
+        return
+
+    caption_low = caption.lower().strip() if caption else ""
+    hoy = datetime.now().strftime("%d/%m/%Y")
+    ticker_in_caption = detect_ticker(caption) if caption else None
+
+    # Detectar tickers también en la imagen vía contexto del caption
+    ticker_for_data = ticker_in_caption
+
+    # Caso 1: caption pide VALORACIÓN explícita
+    if caption_low and any(p in caption_low for p in ["valora", "valoración", "valoracion",
+                                                       "valórame", "valorame", "precio justo",
+                                                       "valor intrínseco", "valor intrinseco",
+                                                       "plantilla"]):
+        send(chat_id, "Mirando la imagen y cruzando con datos reales...")
+        datos_extra = ""
+        if ticker_for_data:
+            fmp_data = format_data_for_claude(get_real_data(ticker_for_data))
+            sec_data = sec_get_filings(ticker_for_data, n=3)
+            ins_data = openinsider_get(ticker_for_data, n=5)
+            datos_extra = f"\n\nDATOS REALES VERIFICADOS:\n{fmp_data}\n\n{sec_data}\n\n{ins_data}"
+        template = load_template()
+        prompt = (f"El usuario te manda una imagen y pide valoración. Caption: \"{caption}\". "
+                  f"Hoy {hoy}. Lee la imagen, identifica la empresa/datos visibles. "
+                  f"Si reconoces la empresa, valórala usando EXACTAMENTE esta plantilla:\n\n"
+                  f"{template}\n\n"
+                  f"REGLAS: No inventes. Si falta dato dilo. Cierra con decisión clara."
+                  f"{datos_extra}")
+        reply = ask_claude_vision(chat_id, img, media_type, prompt, get_system_chat(), max_tokens=1100)
+        send(chat_id, reply)
+        return
+
+    # Caso 2: caption pide ANÁLISIS DE EMPRESA (tarjeta visual)
+    if caption_low and (ticker_for_data or any(p in caption_low for p in
+                       ["analiza", "qué ves", "que ves", "qué dice", "que dice",
+                        "mira esta", "mira este", "tarjeta", "señal"])):
+        send(chat_id, "Analizando imagen como tarjeta visual...")
+        datos_extra = ""
+        if ticker_for_data:
+            datos_extra = f"\n\nDATOS REALES:\n{format_data_for_claude(get_real_data(ticker_for_data))}"
+        prompt = (f"El usuario te manda una imagen con caption: \"{caption}\". Hoy {hoy}. "
+                  f"Lee la imagen, identifica empresa/gráfico/datos. "
+                  f"Responde con la TARJETA VISUAL EXACTA según las reglas del sistema.{datos_extra}")
+        reply = ask_claude_vision(chat_id, img, media_type, prompt, get_system_card(), max_tokens=700)
+        send(chat_id, reply)
+        return
+
+    # Caso 3: caption con instrucción específica
+    if caption_low:
+        send(chat_id, "Mirando la imagen...")
+        prompt = (f"Imagen del usuario con caption: \"{caption}\". Hoy {hoy}. "
+                  f"Responde a lo que te pide en tono colega natural español. "
+                  f"Si la imagen muestra una empresa de su cartera (GOOGL, MSFT, AAPL, JNJ, "
+                  f"VISA, MONC, ZEG, JNJ, SSNC, TXRH, CELH), tenlo en cuenta.")
+        reply = ask_claude_vision(chat_id, img, media_type, prompt, get_system_chat(), max_tokens=600)
+        send(chat_id, reply)
+        return
+
+    # Caso 4: SIN caption — Jarvis decide solo (modo automático)
+    send(chat_id, "Mirando la imagen y decidiendo qué hacer...")
+    prompt = (f"El usuario te manda una imagen sin texto. Hoy {hoy}.\n"
+              f"Identifica qué hay en ella:\n"
+              f"- Si es gráfico/cotización de una empresa → describe lo que ves "
+              f"(empresa, periodo, tendencia, niveles clave) y al final pregunta "
+              f"\"¿quieres tarjeta visual o valoración con plantilla?\"\n"
+              f"- Si es captura de noticias/earnings → resume las claves en 4-5 líneas "
+              f"con tono colega.\n"
+              f"- Si es captura de extracto/cartera → identifica posiciones y movimientos.\n"
+              f"- Si es foto del Excel \"Invertir Desde 0\" → reconoce la plantilla y "
+              f"pregunta qué empresa quieres valorar.\n"
+              f"- Si no es nada de inversión → dilo natural y pregunta qué quería el usuario.\n"
+              f"Tono: colega de bar, español de España, frases cortas.")
+    reply = ask_claude_vision(chat_id, img, media_type, prompt, get_system_chat(), max_tokens=700)
+    send(chat_id, reply)
+
+# ═════════════════════════════════════════════════════
 #  POLLING
 # ═════════════════════════════════════════════════════
 def poll():
     offset = 0
-    logging.info(f"JARVIS v10 - {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    logging.info(f"JARVIS v13 - {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     logging.info(f"FMP:{'OK' if FMP_KEY else 'NO'} | "
                  f"Anthropic:{'OK' if ANTHROPIC_KEY else 'NO'} | "
                  f"Whisper:{'OK' if OPENAI_KEY else 'NO'} | "
@@ -1210,10 +1519,37 @@ def poll():
                 msg = u.get("message", {})
                 cid = msg.get("chat", {}).get("id")
                 if not cid: continue
+
+                # Foto (imagen normal)
+                photo = msg.get("photo")
+                if photo and isinstance(photo, list) and photo:
+                    # Telegram manda varias resoluciones, cogemos la mayor (última)
+                    file_id = photo[-1].get("file_id")
+                    caption = msg.get("caption", "")
+                    if file_id:
+                        threading.Thread(target=handle_image,
+                                         args=(cid, file_id, caption), daemon=True).start()
+                    continue
+
+                # Documento que sea imagen
+                doc = msg.get("document")
+                if doc:
+                    mime = doc.get("mime_type", "")
+                    if mime.startswith("image/"):
+                        file_id = doc.get("file_id")
+                        caption = msg.get("caption", "")
+                        if file_id:
+                            threading.Thread(target=handle_image,
+                                             args=(cid, file_id, caption), daemon=True).start()
+                        continue
+
+                # Texto
                 txt = msg.get("text", "")
                 if txt:
                     threading.Thread(target=handle, args=(cid, txt), daemon=True).start()
                     continue
+
+                # Voz
                 voice = msg.get("voice")
                 if voice and voice.get("file_id"):
                     threading.Thread(target=handle_voice, args=(cid, voice["file_id"]), daemon=True).start()
@@ -1232,7 +1568,7 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self._send_text(200)
-        msg = f"JARVIS v10 - {datetime.now().strftime('%d/%m/%Y %H:%M')} - Online"
+        msg = f"JARVIS v13 - {datetime.now().strftime('%d/%m/%Y %H:%M')} - Online"
         self.wfile.write(msg.encode("utf-8"))
 
     def do_HEAD(self):
