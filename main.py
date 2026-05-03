@@ -684,7 +684,7 @@ VISA nueva. NKE vendida.
 - Pregunta puntual: 2-4 frases
 - Conversación: 3-6 frases máximo
 - Resultado Dexter / valoración: las 9 secciones de la plantilla SIN RECORTAR
-"""
+""" + (("\n\n═══ SKILLS MODULARES (archivos editables) ═══\n" + load_all_skills()) if load_all_skills() else "")
 
 # ═════════════════════════════════════════════════════
 #  MEMORIA SQLITE + SUPABASE
@@ -711,6 +711,16 @@ def _memory_conn():
         tx_hash TEXT NOT NULL UNIQUE, broker TEXT, fecha TEXT,
         accion TEXT, ticker TEXT, importe_eur REAL, asunto TEXT,
         created_at TEXT NOT NULL)""")
+    # L2 — Memoria semántica (embeddings) cache local
+    conn.execute("""CREATE TABLE IF NOT EXISTS jarvis_embeddings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        embedding TEXT NOT NULL,
+        importance INTEGER DEFAULT 5,
+        tags TEXT,
+        created_at TEXT NOT NULL)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_emb_chat ON jarvis_embeddings(chat_id)")
     conn.commit()
     return conn
 
@@ -814,6 +824,372 @@ def load_memory(chat_id, limit=6):
     return load_memory_local(chat_id, limit=limit)
 
 # ═════════════════════════════════════════════════════
+#  L2 — MEMORIA SEMÁNTICA INFINITA (embeddings OpenAI)
+#  Cada conversación → vector matemático en Supabase pgvector
+#  Búsqueda por SIGNIFICADO, no por fecha
+# ═════════════════════════════════════════════════════
+EMBEDDING_MODEL = "text-embedding-3-small"  # barato y bueno
+EMBEDDING_DIM = 1536
+
+def embed_text(text):
+    """Convierte texto en vector de 1536 dimensiones."""
+    if not OPENAI_KEY: return None
+    try:
+        clean = (text or "")[:8000].strip()
+        if not clean: return None
+        r = requests.post("https://api.openai.com/v1/embeddings",
+            headers={"Authorization": f"Bearer {OPENAI_KEY}",
+                     "Content-Type": "application/json"},
+            json={"input": clean, "model": EMBEDDING_MODEL},
+            timeout=15)
+        if r.status_code == 200:
+            return r.json()["data"][0]["embedding"]
+    except Exception as e:
+        logging.error(f"Embed: {e}")
+    return None
+
+def cosine_similarity(v1, v2):
+    """Similitud coseno entre dos vectores."""
+    try:
+        dot = sum(a*b for a, b in zip(v1, v2))
+        n1 = sum(a*a for a in v1) ** 0.5
+        n2 = sum(b*b for b in v2) ** 0.5
+        if n1 == 0 or n2 == 0: return 0
+        return dot / (n1 * n2)
+    except:
+        return 0
+
+def save_semantic(chat_id, content, importance=5, tags=""):
+    """Guarda contenido + embedding en Supabase + SQLite local."""
+    if not content or len(content.strip()) < 10: return
+    embedding = embed_text(content)
+    if not embedding: return
+    emb_str = json.dumps(embedding)
+
+    # Local
+    try:
+        with memory_lock:
+            conn = _memory_conn()
+            conn.execute("""INSERT INTO jarvis_embeddings
+                (chat_id, content, embedding, importance, tags, created_at)
+                VALUES(?,?,?,?,?,?)""",
+                (str(chat_id), content[:4000], emb_str, importance, tags, utc_now()))
+            conn.commit(); conn.close()
+    except Exception as e:
+        logging.error(f"Embed save local: {e}")
+
+    # Supabase con pgvector
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            requests.post(f"{SUPABASE_URL}/rest/v1/jarvis_embeddings",
+                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                         "Content-Type": "application/json", "Prefer": "return=minimal"},
+                json={"chat_id": str(chat_id), "content": content[:4000],
+                      "embedding": embedding, "importance": importance,
+                      "tags": tags, "created_at": utc_now()},
+                timeout=8)
+        except Exception as e:
+            logging.error(f"Embed save supa: {e}")
+
+def search_semantic(chat_id, query, top_k=5):
+    """Busca los k recuerdos más relevantes por similitud semántica."""
+    if not OPENAI_KEY: return []
+    query_emb = embed_text(query)
+    if not query_emb: return []
+
+    # Intento 1: Supabase con función RPC pgvector si existe
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            r = requests.post(f"{SUPABASE_URL}/rest/v1/rpc/match_jarvis_memories",
+                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                         "Content-Type": "application/json"},
+                json={"query_embedding": query_emb, "match_chat_id": str(chat_id),
+                      "match_count": top_k, "match_threshold": 0.3},
+                timeout=10)
+            if r.status_code == 200:
+                rows = r.json()
+                if isinstance(rows, list) and rows:
+                    return [{"content": x.get("content",""),
+                             "similarity": x.get("similarity", 0),
+                             "created_at": x.get("created_at","")} for x in rows]
+        except Exception as e:
+            logging.info(f"Supabase RPC fallback: {e}")
+
+    # Intento 2: SQLite local con cálculo manual (siempre funciona)
+    try:
+        with memory_lock:
+            conn = _memory_conn()
+            rows = conn.execute("""SELECT content, embedding, created_at
+                FROM jarvis_embeddings WHERE chat_id=?
+                ORDER BY id DESC LIMIT 200""", (str(chat_id),)).fetchall()
+            conn.close()
+        scored = []
+        for content, emb_str, created_at in rows:
+            try:
+                emb = json.loads(emb_str)
+                score = cosine_similarity(query_emb, emb)
+                scored.append({"content": content, "similarity": score,
+                              "created_at": created_at})
+            except: continue
+        scored.sort(key=lambda x: x["similarity"], reverse=True)
+        return scored[:top_k]
+    except Exception as e:
+        logging.error(f"Search semantic local: {e}")
+    return []
+
+def format_semantic_recalls(recalls):
+    """Formatea recuerdos relevantes para inyectar en el prompt."""
+    if not recalls: return ""
+    out = ["RECUERDOS RELEVANTES (memoria infinita L2):"]
+    for r in recalls:
+        sim = r.get("similarity", 0)
+        if sim < 0.4: continue  # umbral mínimo de relevancia
+        date = r.get("created_at", "")[:10]
+        snippet = r["content"][:400]
+        out.append(f"  [{date} · {sim:.0%}] {snippet}")
+    return "\n".join(out) if len(out) > 1 else ""
+
+# ═════════════════════════════════════════════════════
+#  AUTO-LEARNING — Jarvis aprende de cada conversación
+# ═════════════════════════════════════════════════════
+def auto_learn_from_conversation(chat_id, user_msg, assistant_reply):
+    """Extrae aprendizajes nuevos sobre Miki y los guarda en knowledge."""
+    if not ANTHROPIC_KEY: return
+    if len(user_msg) < 30: return  # mensajes muy cortos no aportan
+
+    prompt = (
+        f"Eres el meta-cerebro de Jarvis. Analiza este intercambio reciente:\n\n"
+        f"MIKI: {user_msg[:600]}\n"
+        f"JARVIS: {assistant_reply[:600]}\n\n"
+        f"¿Hay algo NUEVO sobre Miki que Jarvis deba recordar PARA SIEMPRE?\n"
+        f"Por ejemplo: una nueva preferencia, una posición que abrió, una idea de inversión, "
+        f"un cambio en su estrategia, una empresa que está siguiendo, una restricción suya.\n\n"
+        f"Responde EXACTAMENTE con uno de estos dos formatos:\n"
+        f"A) Si NO hay nada nuevo importante → responde solo: NO\n"
+        f"B) Si SÍ hay algo nuevo → responde: SI|<categoría>|<frase corta del aprendizaje>\n"
+        f"     Categorías: posicion, preferencia, estrategia, restriccion, idea, contacto, otro\n"
+        f"     Ejemplo: SI|posicion|Miki ha abierto posición en NVDA por 500€"
+    )
+    try:
+        result = claude_call(
+            "Extractor de aprendizajes para meta-memoria de Jarvis. Conciso, español.",
+            prompt, max_tokens=150
+        )
+        if not result or result.strip().upper().startswith("NO"): return
+        if "|" in result:
+            parts = result.split("|", 2)
+            if len(parts) >= 3:
+                categoria = parts[1].strip().lower()[:40]
+                aprendizaje = parts[2].strip()[:400]
+                if aprendizaje and len(aprendizaje) > 8:
+                    key = f"auto_{categoria}_{int(time.time())}"
+                    upsert_knowledge(chat_id, key, aprendizaje)
+                    save_semantic(chat_id, aprendizaje, importance=8, tags=f"auto,{categoria}")
+                    logging.info(f"[AUTO-LEARN] {chat_id}: {categoria} → {aprendizaje[:80]}")
+    except Exception as e:
+        logging.error(f"Auto-learn: {e}")
+
+# ═════════════════════════════════════════════════════
+#  SKILLS MODULARES — SOUL/AGENTS/SKILLS/USER en archivos
+# ═════════════════════════════════════════════════════
+SKILL_PATHS = {
+    "soul": "SOUL.md",
+    "agents": "AGENTS.md",
+    "skills": "SKILLS.md",
+    "user": "USER.md",
+}
+
+def load_skill(name):
+    """Lee archivo de skill (devuelve contenido o cadena vacía)."""
+    path = SKILL_PATHS.get(name)
+    if not path: return ""
+    p = Path(path)
+    if p.exists():
+        try: return p.read_text(encoding="utf-8").strip()
+        except: pass
+    return ""
+
+def load_all_skills():
+    """Devuelve los 4 archivos del cerebro modular concatenados."""
+    out = []
+    for name in ("soul", "user", "agents", "skills"):
+        content = load_skill(name)
+        if content:
+            out.append(f"═══ {name.upper()}.md ═══\n{content}")
+    return "\n\n".join(out)
+
+# ═════════════════════════════════════════════════════
+#  TOOL USE NATIVO — Claude decide qué fuentes usar
+# ═════════════════════════════════════════════════════
+JARVIS_TOOLS = [
+    {
+        "name": "get_real_data_fmp",
+        "description": "Obtiene datos financieros reales de una empresa: precio actual, PER, ROE, ROIC, FCF, market cap, margen operativo, deuda, EPS desde Financial Modeling Prep. Usar para CUALQUIER pregunta que requiera precio o métricas fundamentales.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ticker": {"type": "string", "description": "Ticker bursátil (ej: AAPL, MSFT, GOOGL)"},
+            },
+            "required": ["ticker"],
+        },
+    },
+    {
+        "name": "get_sec_filings",
+        "description": "Obtiene los últimos filings SEC EDGAR oficiales de una empresa (10-K, 10-Q, 8-K, Forms 4). Usar para verificar info regulatoria.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ticker": {"type": "string"},
+                "n": {"type": "integer", "description": "Número de filings, default 5"},
+            },
+            "required": ["ticker"],
+        },
+    },
+    {
+        "name": "get_insiders",
+        "description": "Compras/ventas de directivos (insiders) en OpenInsider. Usar cuando se pregunte por insiders, smart money, compras del CEO/CFO.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ticker": {"type": "string"},
+            },
+            "required": ["ticker"],
+        },
+    },
+    {
+        "name": "get_macro_usa",
+        "description": "Datos macro REALES de USA desde FRED: tipos FED, CPI, paro, bono 10y, VIX, dólar. Usar cuando se pregunte por FED, inflación USA, macro USA.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_macro_europa",
+        "description": "Datos macro REALES de zona euro desde ECB: tipos depósito BCE, refinanciación. Usar para BCE, eurozona.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "search_news",
+        "description": "Busca noticias actuales en la web vía Tavily. Usar para noticias recientes, sentimiento, eventos del día.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Búsqueda en inglés es mejor"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "calculate_dcf",
+        "description": "Calcula DCF (Discounted Cash Flow) para una empresa madura con 3 escenarios. NO usar para tech de alto crecimiento.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ticker": {"type": "string"},
+            },
+            "required": ["ticker"],
+        },
+    },
+    {
+        "name": "search_memory_semantic",
+        "description": "Busca en la memoria infinita L2 de Jarvis. Usar cuando Miki pregunte por conversaciones pasadas, decisiones anteriores o contexto histórico.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "get_etf_holdings",
+        "description": "Top holdings oficiales de ETFs iShares (IVV=SP500, INDA=India).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "etf": {"type": "string"},
+            },
+            "required": ["etf"],
+        },
+    },
+]
+
+def execute_tool(tool_name, tool_input, chat_id="webapp"):
+    """Ejecuta una tool y devuelve el resultado como string."""
+    try:
+        if tool_name == "get_real_data_fmp":
+            ticker = tool_input.get("ticker", "").upper()
+            return format_data_for_claude(get_real_data(ticker))
+        if tool_name == "get_sec_filings":
+            return sec_get_filings(tool_input.get("ticker"), n=tool_input.get("n", 5))
+        if tool_name == "get_insiders":
+            return openinsider_get(tool_input.get("ticker"), n=10)
+        if tool_name == "get_macro_usa":
+            return fred_macro_snapshot() or "FRED no disponible"
+        if tool_name == "get_macro_europa":
+            return ecb_macro_snapshot() or "ECB no disponible"
+        if tool_name == "search_news":
+            return search_news(tool_input.get("query", ""), n=4)
+        if tool_name == "calculate_dcf":
+            return dcf_full_analysis(tool_input.get("ticker"))
+        if tool_name == "search_memory_semantic":
+            recalls = search_semantic(chat_id, tool_input.get("query", ""), top_k=5)
+            return format_semantic_recalls(recalls) or "No hay recuerdos relevantes."
+        if tool_name == "get_etf_holdings":
+            return ishares_top_holdings(tool_input.get("etf", "").upper())
+        return f"Tool {tool_name} no reconocida"
+    except Exception as e:
+        return f"Error ejecutando {tool_name}: {e}"
+
+def claude_with_tools(chat_id, user_msg, system_prompt, max_iters=4):
+    """Claude con tool_use loop nativo. Decide solo qué tools llamar."""
+    if not ANTHROPIC_KEY: return "Sin ANTHROPIC_API_KEY."
+    messages = [{"role": "user", "content": user_msg}]
+    iters = 0
+    while iters < max_iters:
+        try:
+            r = requests.post("https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={"model": "claude-sonnet-4-20250514", "max_tokens": 1500,
+                      "system": system_prompt, "messages": messages,
+                      "tools": JARVIS_TOOLS}, timeout=60)
+            data = r.json()
+            if "error" in data:
+                return f"Error API: {data['error'].get('message','')[:120]}"
+
+            stop_reason = data.get("stop_reason")
+            content = data.get("content", [])
+
+            # Si Claude pide tools, ejecutarlas
+            if stop_reason == "tool_use":
+                messages.append({"role": "assistant", "content": content})
+                tool_results = []
+                for block in content:
+                    if block.get("type") == "tool_use":
+                        tname = block.get("name")
+                        tinput = block.get("input", {})
+                        tid = block.get("id")
+                        result = execute_tool(tname, tinput, chat_id)
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tid,
+                            "content": str(result)[:6000],
+                        })
+                        logging.info(f"[TOOL_USE] {tname}({tinput}) → {len(str(result))} chars")
+                messages.append({"role": "user", "content": tool_results})
+                iters += 1
+                continue
+
+            # Respuesta final
+            text_blocks = [b.get("text", "") for b in content if b.get("type") == "text"]
+            return "\n".join(text_blocks).strip() or "Sin respuesta."
+        except Exception as e:
+            logging.error(f"claude_with_tools: {e}")
+            return f"Error: {e}"
+    return "Demasiadas iteraciones de tools."
+
+
+
+# ═════════════════════════════════════════════════════
 #  PLANTILLA DE VALORACIÓN
 # ═════════════════════════════════════════════════════
 def load_template():
@@ -842,9 +1218,14 @@ def ask_claude(chat_id, text, system_prompt, web_data="", max_tokens=600):
     facts_txt = "\n".join([f"- {k}: {v}" for k,v in facts]) if facts else ""
     tx_txt = "\n".join([f"- {t[0]} {t[2]} {t[3] or '?'} {t[4] or ''} EUR" for t in txs]) if txs else ""
 
+    # 🧠 L2 — Memoria semántica infinita (busca recuerdos relevantes por significado)
+    semantic_recalls = search_semantic(chat_id, text, top_k=5)
+    semantic_txt = format_semantic_recalls(semantic_recalls)
+
     extras = ""
-    if facts_txt: extras += f"\n\nMEMORIA_LARGA:\n{facts_txt}"
-    if tx_txt: extras += f"\n\nTX_GMAIL:\n{tx_txt}"
+    if facts_txt: extras += f"\n\nMEMORIA_LARGA (hechos persistentes):\n{facts_txt}"
+    if tx_txt: extras += f"\n\nTX_GMAIL (movimientos brokers):\n{tx_txt}"
+    if semantic_txt: extras += f"\n\n{semantic_txt}"
 
     if web_data:
         content = f"{text}\n\n{web_data}{extras}"
@@ -877,6 +1258,23 @@ def ask_claude(chat_id, text, system_prompt, web_data="", max_tokens=600):
         history[chat_id].append({"role": "assistant", "content": reply})
         save_memory(chat_id, "user", text[:600])
         save_memory(chat_id, "assistant", reply[:600])
+
+        # 🧠 L2 — Guardar este intercambio como embedding
+        if len(text) > 20:
+            try:
+                save_semantic(chat_id, f"USUARIO: {text[:600]}\nJARVIS: {reply[:600]}",
+                              importance=5, tags="conversation")
+            except Exception as e:
+                logging.error(f"Save semantic: {e}")
+
+        # 🤖 AUTO-LEARNING — extrae aprendizaje en background (no bloquea)
+        if len(text) > 30:
+            threading.Thread(
+                target=auto_learn_from_conversation,
+                args=(chat_id, text, reply),
+                daemon=True
+            ).start()
+
         return reply
     except Exception as e:
         logging.error(f"Claude: {e}")
@@ -1494,12 +1892,31 @@ def handle(chat_id, text):
         send(chat_id, f"Tu chat ID es: {chat_id}")
         return
 
-    # Memoria permanente
+    # Memoria permanente (knowledge + L2 semántica)
     if txt_low.startswith("recuerda que "):
         fact = txt[12:].strip()
         if fact:
             upsert_knowledge(chat_id, f"fact_{int(time.time())}", fact)
-            send(chat_id, "Anotado. Lo tendré en cuenta siempre.")
+            save_semantic(chat_id, f"HECHO PERMANENTE: {fact}",
+                          importance=10, tags="permanente,user_request")
+            send(chat_id, "✅ Anotado. Lo tendré en cuenta siempre (knowledge + L2 semántica).")
+        return
+
+    # Búsqueda explícita en memoria infinita
+    if any(t in txt_low for t in ["recuerdas", "te acuerdas", "qué dijimos", "que dijimos",
+                                   "qué hablamos", "que hablamos", "buscar en memoria",
+                                   "memoria infinita"]):
+        typing(chat_id)
+        send(chat_id, "🧠 Buscando en tu memoria infinita L2...")
+        recalls = search_semantic(chat_id, txt, top_k=8)
+        if not recalls:
+            send(chat_id, "No he encontrado recuerdos relevantes.")
+            return
+        formatted = format_semantic_recalls(recalls)
+        prompt = (f"Miki te pregunta: \"{txt}\"\n\n{formatted}\n\n"
+                  f"Resúmele lo que recuerdas sobre eso, en tono colega, 4-6 frases.")
+        reply = ask_claude(chat_id, prompt, get_system_chat(), max_tokens=500)
+        send(chat_id, reply)
         return
 
     # Gmail (MyInvestor + Trade Republic + ING)
@@ -1595,6 +2012,20 @@ def handle(chat_id, text):
             send(chat_id, reply)
             audio = tts(reply[:500])
             if audio: send_audio(chat_id, audio)
+            return
+
+        # ─── AUTOPILOT (Claude decide solo qué tools usar) ───
+        AUTOPILOT_TRIGGERS = ["autopilot", "auto", "decide tu", "decide tú",
+                              "tú decides", "tu decides", "lo que veas",
+                              "lo que sea necesario", "haz lo que veas",
+                              "investiga tú", "investiga tu"]
+        if any(p in txt_low for p in AUTOPILOT_TRIGGERS):
+            typing(chat_id)
+            send(chat_id, f"🤖 AUTOPILOT activado para {ticker}.\n"
+                          f"Decido qué fuentes consultar (FMP/SEC/Insiders/News/Macro/Wiki/Memoria).\n"
+                          f"30-60 segundos.")
+            reply = claude_with_tools(chat_id, txt, get_system_chat(), max_iters=5)
+            send(chat_id, reply)
             return
 
         # ─── EQUIPO JARVIS (subagentes TradingAgents-style) ───
@@ -1857,7 +2288,7 @@ def handle_image(chat_id, file_id, caption=""):
 # ═════════════════════════════════════════════════════
 def poll():
     offset = 0
-    logging.info(f"JARVIS v15 - {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    logging.info(f"JARVIS v16 OPEN BRAIN - {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     logging.info(f"FMP:{'OK' if FMP_KEY else 'NO'} | "
                  f"Anthropic:{'OK' if ANTHROPIC_KEY else 'NO'} | "
                  f"Whisper:{'OK' if OPENAI_KEY else 'NO'} | "
@@ -2105,11 +2536,11 @@ class H(BaseHTTPRequestHandler):
             if not self._guard(path, protected=False): return
 
             if path in ("/", "/health"):
-                self._text(f"JARVIS v15 - {datetime.now().strftime('%d/%m/%Y %H:%M')} - Online", 200)
+                self._text(f"JARVIS v16 OPEN BRAIN - {datetime.now().strftime('%d/%m/%Y %H:%M')} - Online", 200)
                 return
 
             if path == "/app":
-                html = JARVIS_APP_HTML.replace("__APP_VERSION__", "JARVIS v15")
+                html = JARVIS_APP_HTML.replace("__APP_VERSION__", "JARVIS v16 OPEN BRAIN")
                 self._html(html, 200); return
 
             if path == "/favicon.ico":
@@ -2225,4 +2656,3 @@ def main():
     HTTPServer(("0.0.0.0", PORT), H).serve_forever()
 
 if __name__ == "__main__":
-    main()
