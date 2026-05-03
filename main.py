@@ -981,6 +981,283 @@ def dexter_research(chat_id, ticker, user_question):
     )
     return ask_claude(chat_id, final_prompt, get_system_chat(), max_tokens=1300)
 
+# ═════════════════════════════════════════════════════
+#  EQUIPO JARVIS — Subagentes (estilo TradingAgents)
+#  4 ANALISTAS + DEBATE BULL/BEAR + RIESGO + FUND MANAGER
+#  Esto se SUMA a Dexter, no lo reemplaza.
+# ═════════════════════════════════════════════════════
+def jarvis_team_research(chat_id, ticker, user_question):
+    """
+    Equipo institucional completo:
+    1) 4 ANALISTAS en paralelo (Fundamental, Sentiment, Technical, Insider)
+    2) DEBATE Bull vs Bear vs Síntesis
+    3) GESTOR RIESGO (conservador + agresivo)
+    4) FUND MANAGER → decisión final con plantilla EXACTA
+    """
+    log_step = lambda s: logging.info(f"[EQUIPO {ticker}] {s}")
+
+    # ─── DATOS BASE ───
+    fmp_data = format_data_for_claude(get_real_data(ticker))
+    sec_data = sec_get_filings(ticker, n=5)
+    ins_data = openinsider_get(ticker, n=8)
+    news_data = search_news(f"{ticker} earnings revenue guidance latest", n=4)
+    macro_data = fred_macro_snapshot() if FRED_KEY else ""
+
+    # ─── 4 ANALISTAS ───
+    log_step("4 analistas en paralelo...")
+
+    analyst_fundamental = claude_call(
+        "Eres analista FUNDAMENTAL value tipo Buffett/Klarman. Español de España, directo.",
+        f"Analiza {ticker} desde fundamentales: ROE, ROIC, margen op, FCF, deuda, calidad capital "
+        f"allocation. Datos:\n{fmp_data}\n{sec_data}\n\nDevuelve SOLO 4 líneas:\n"
+        f"- Tesis (1 línea)\n- Calidad (1 línea)\n- Valoración (1 línea)\n- Convicción 0-10 (1 línea)",
+        max_tokens=300
+    )
+
+    analyst_sentiment = claude_call(
+        "Eres analista de SENTIMIENTO de mercado (noticias, narrativa, momentum opinión).",
+        f"Analiza sentimiento sobre {ticker}.\nNoticias:\n{news_data}\n\n"
+        f"4 líneas: tono general, narrativa dominante, riesgo reputacional, score 0-10.",
+        max_tokens=250
+    )
+
+    analyst_technical = claude_call(
+        "Eres analista TÉCNICO (precio, soportes/resistencias, momentum).",
+        f"Analiza técnicamente {ticker}:\n{fmp_data}\n\n"
+        f"4 líneas: tendencia, posición rango 52s, soporte/resistencia clave, score técnico 0-10.",
+        max_tokens=250
+    )
+
+    analyst_insider = claude_call(
+        "Eres analista de INSIDERS y smart money.",
+        f"Analiza movimientos insiders {ticker}:\n{ins_data or 'sin datos'}\n\n"
+        f"4 líneas: ¿compras del CEO/CFO recientes?, ¿ventas planeadas o discrecionales?, "
+        f"¿señal alcista/bajista?, score 0-10.",
+        max_tokens=250
+    )
+
+    # ─── DEBATE BULL vs BEAR ───
+    log_step("Debate Bull vs Bear...")
+    analystas_combined = (
+        f"FUNDAMENTAL:\n{analyst_fundamental}\n\n"
+        f"SENTIMENT:\n{analyst_sentiment}\n\n"
+        f"TECHNICAL:\n{analyst_technical}\n\n"
+        f"INSIDER:\n{analyst_insider}"
+    )
+
+    bull_case = claude_call(
+        "Eres el RESEARCHER ALCISTA. Defiendes la tesis larga con argumentos sólidos.",
+        f"Conoces {ticker}. Datos analistas:\n{analystas_combined}\n\n"
+        f"Da 3 razones potentes para COMPRAR/MANTENER. Sé concreto, no humo.",
+        max_tokens=300
+    )
+
+    bear_case = claude_call(
+        "Eres el RESEARCHER BAJISTA. Buscas las grietas y riesgos. Sin pesimismo gratuito.",
+        f"Conoces {ticker}. Datos analistas:\n{analystas_combined}\n\n"
+        f"Da 3 razones potentes para REDUCIR/VENDER o NO comprar. Concreto, basado en datos.",
+        max_tokens=300
+    )
+
+    # ─── GESTORES DE RIESGO ───
+    log_step("Gestores de riesgo...")
+    risk_conservative = claude_call(
+        "Eres gestor de riesgo CONSERVADOR. Prioridad: preservar capital. Margen seguridad 30%+.",
+        f"Para {ticker}, dado este contexto:\n{analystas_combined}\n\nBull:\n{bull_case}\n\n"
+        f"Bear:\n{bear_case}\n\nDi tamaño máximo posición (% cartera) y stop mental. 3 líneas.",
+        max_tokens=200
+    )
+
+    risk_aggressive = claude_call(
+        "Eres gestor de riesgo AGRESIVO. Prioridad: rentabilidad asimétrica. Convicción 8+.",
+        f"Para {ticker}, dado todo lo anterior, ¿qué tamaño y zona de entrada agresiva? 3 líneas.",
+        max_tokens=200
+    )
+
+    # ─── FUND MANAGER FINAL → PLANTILLA EXACTA ───
+    log_step("Fund manager: rellenando plantilla...")
+    template = load_template()
+
+    fund_manager_prompt = (
+        f"Eres el FUND MANAGER de Miki. Has recibido el análisis completo de tu equipo sobre {ticker}.\n"
+        f"Pregunta original: \"{user_question}\"\n"
+        f"Hoy: {datetime.now().strftime('%d/%m/%Y')}\n\n"
+        f"═══ ANÁLISIS DEL EQUIPO ═══\n{analystas_combined}\n\n"
+        f"═══ DEBATE ═══\n🐂 BULL:\n{bull_case}\n\n🐻 BEAR:\n{bear_case}\n\n"
+        f"═══ RIESGO ═══\n🛡️ Conservador:\n{risk_conservative}\n\n⚡ Agresivo:\n{risk_aggressive}\n\n"
+        f"═══ DATOS REALES ═══\n{fmp_data}\n\n{sec_data}\n\n{ins_data}\n\n{macro_data}\n\n"
+        f"═══ TU TAREA ═══\n"
+        f"RELLENA EXACTAMENTE esta plantilla con datos reales. NO inventes nada. "
+        f"Si falta dato, pon 'NO DISPONIBLE' y sigue. Las 9 secciones obligatorias:\n\n"
+        f"{template}\n\n"
+        f"Después de la plantilla añade un epígrafe corto:\n"
+        f"═══ DECISIÓN DEL EQUIPO ═══\nUna línea por miembro: Fundamental, Sentiment, Technical, "
+        f"Insider, Bull, Bear, Riesgo conservador, Riesgo agresivo, **TÚ (Fund Manager)**."
+    )
+
+    return ask_claude(chat_id, fund_manager_prompt, get_system_chat(), max_tokens=1700)
+
+# ═════════════════════════════════════════════════════
+#  DCF CALCULATOR — Para JNJ, SSNC, mature companies
+# ═════════════════════════════════════════════════════
+def dcf_calculator(fcf_actual, growth_rate=0.05, discount_rate=0.10,
+                   terminal_growth=0.03, years=10, shares_outstanding=None):
+    """
+    DCF simple value-investing.
+    Devuelve dict con valor intrínseco por acción + escenarios.
+    Solo para empresas maduras (NO tech de alto crecimiento).
+    """
+    try:
+        if not fcf_actual or fcf_actual <= 0:
+            return {"error": "FCF inválido"}
+
+        # Proyección 10 años
+        fcf_proyectado = []
+        fcf = fcf_actual
+        for year in range(1, years + 1):
+            fcf = fcf * (1 + growth_rate)
+            fcf_proyectado.append(fcf)
+
+        # Valor presente de cada FCF
+        vp_fcf = sum(fcf_proyectado[i] / ((1 + discount_rate) ** (i + 1)) for i in range(years))
+
+        # Valor terminal (modelo Gordon)
+        vt = fcf_proyectado[-1] * (1 + terminal_growth) / (discount_rate - terminal_growth)
+        vp_terminal = vt / ((1 + discount_rate) ** years)
+
+        valor_total = vp_fcf + vp_terminal
+
+        result = {
+            "valor_total_empresa": valor_total,
+            "vp_fcf_10y": vp_fcf,
+            "vp_terminal": vp_terminal,
+            "fcf_actual": fcf_actual,
+            "growth_rate": growth_rate,
+            "discount_rate": discount_rate,
+            "terminal_growth": terminal_growth,
+        }
+
+        if shares_outstanding and shares_outstanding > 0:
+            result["valor_por_accion"] = valor_total / shares_outstanding
+
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+def dcf_full_analysis(ticker):
+    """DCF completo con datos reales FMP + 3 escenarios."""
+    data = get_real_data(ticker)
+    if data.get("error") or data.get("_fallback") or data.get("is_european"):
+        return f"DCF no disponible para {ticker}: necesito datos FMP completos."
+
+    market_cap = data.get("market_cap")
+    fcf_per_share = data.get("fcf_per_share")
+    price = data.get("price")
+
+    if not (market_cap and fcf_per_share and price):
+        return f"DCF {ticker}: faltan datos (market_cap, FCF/share o precio)."
+
+    shares = market_cap / price if price else None
+    fcf_total = fcf_per_share * shares if shares else None
+
+    if not fcf_total or fcf_total <= 0:
+        return f"DCF {ticker}: FCF no positivo, modelo no aplicable."
+
+    # 3 escenarios
+    conservador = dcf_calculator(fcf_total, growth_rate=0.03, discount_rate=0.11,
+                                  terminal_growth=0.02, shares_outstanding=shares)
+    base = dcf_calculator(fcf_total, growth_rate=0.05, discount_rate=0.10,
+                          terminal_growth=0.03, shares_outstanding=shares)
+    optimista = dcf_calculator(fcf_total, growth_rate=0.08, discount_rate=0.09,
+                                terminal_growth=0.04, shares_outstanding=shares)
+
+    out = [f"DCF de {ticker} (precio actual: ${price:.2f}):"]
+    out.append(f"  Conservador (g=3%, r=11%): ${conservador.get('valor_por_accion',0):.2f}/acción")
+    out.append(f"  Base (g=5%, r=10%): ${base.get('valor_por_accion',0):.2f}/acción")
+    out.append(f"  Optimista (g=8%, r=9%): ${optimista.get('valor_por_accion',0):.2f}/acción")
+
+    if base.get("valor_por_accion"):
+        margen = (base["valor_por_accion"] - price) / base["valor_por_accion"] * 100
+        out.append(f"  Margen seguridad (escenario base): {margen:+.1f}%")
+
+    return "\n".join(out)
+
+# ═════════════════════════════════════════════════════
+#  ALERTAS AUTOMÁTICAS — caída fuerte de posición
+# ═════════════════════════════════════════════════════
+ALERT_THRESHOLDS = {
+    # ticker: (% caída diaria, % subida diaria)
+    "default": (-3.0, 5.0),
+}
+
+def check_portfolio_alerts():
+    """Revisa cartera y avisa si alguna posición cae/sube fuerte."""
+    if not MIKI_CHAT_ID: return
+    cartera = ["GOOGL", "MSFT", "AAPL", "JNJ", "VISA", "SSNC", "TXRH", "CELH"]
+    alerts = []
+    for ticker in cartera:
+        data = get_real_data(ticker)
+        if data.get("error") or data.get("_fallback"): continue
+        change = data.get("change_pct")
+        if change is None: continue
+        down, up = ALERT_THRESHOLDS.get(ticker, ALERT_THRESHOLDS["default"])
+        if change <= down:
+            alerts.append(f"🔴 {ticker} cae {change:+.2f}% hoy (precio ${data.get('price','?'):.2f})")
+        elif change >= up:
+            alerts.append(f"🟢 {ticker} sube {change:+.2f}% hoy (precio ${data.get('price','?'):.2f})")
+    if alerts:
+        msg = "🚨 ALERTAS DE CARTERA · " + datetime.now().strftime('%d/%m/%Y %H:%M') + "\n\n"
+        msg += "\n".join(alerts)
+        msg += "\n\nDi \"valórame [TICKER]\" para análisis profundo."
+        send(MIKI_CHAT_ID, msg)
+
+def alerts_loop():
+    """Revisa alertas cada hora durante mercado USA abierto."""
+    if not MIKI_CHAT_ID: return
+    time.sleep(180)
+    while True:
+        try:
+            # Solo en horario USA aproximado (15:30-22:00 España)
+            now = datetime.now()
+            if now.weekday() < 5 and 15 <= now.hour < 22:
+                check_portfolio_alerts()
+        except Exception as e:
+            logging.error(f"Alerts: {e}")
+        time.sleep(3600)  # 1 hora
+
+# ═════════════════════════════════════════════════════
+#  FUENTES EXTRA — Wikipedia + EconDB (filosofía OpenBB)
+# ═════════════════════════════════════════════════════
+def wiki_company_summary(company_name, lang="en"):
+    """Resumen Wikipedia de una empresa (sin key)."""
+    try:
+        url = f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{company_name.replace(' ', '_')}"
+        r = requests.get(url, timeout=10, headers={"User-Agent": "jarvis-miki/1.0"})
+        if r.status_code == 200:
+            data = r.json()
+            extract = data.get("extract", "")[:600]
+            if extract:
+                return f"WIKIPEDIA ({company_name}):\n{extract}"
+    except Exception as e:
+        logging.error(f"Wiki {company_name}: {e}")
+    return ""
+
+def get_company_full_context(ticker, name=None):
+    """Junta TODAS las fuentes para contexto completo de una empresa."""
+    out = []
+    fmp = format_data_for_claude(get_real_data(ticker))
+    if fmp: out.append(fmp)
+    sec = sec_get_filings(ticker, n=3)
+    if sec: out.append(sec)
+    ins = openinsider_get(ticker, n=5)
+    if ins: out.append(ins)
+    if name:
+        wiki = wiki_company_summary(name)
+        if wiki: out.append(wiki)
+    news = search_news(f"{ticker} stock earnings news latest", n=3)
+    if news: out.append(f"NOTICIAS:\n{news}")
+    return "\n\n".join(out)
+
 
 def tts(text):
     if not ELEVENLABS_KEY: return None
@@ -1177,15 +1454,29 @@ def gmail_monitor_loop():
 #  BRIEFING AUTÓNOMO
 # ═════════════════════════════════════════════════════
 def autonomous_briefing_loop():
+    """Briefing autónomo: NO texto libre, sino TARJETAS estilo Miki por cada posición clave."""
     if not (AUTONOMY_ENABLED and MIKI_CHAT_ID): return
     time.sleep(120)
     while True:
         try:
-            datos = get_real_data_multi(["GOOGL", "MSFT", "AAPL", "JNJ", "VISA"])
-            prompt = ("Briefing autónomo para Miki como asesor privado. "
-                      "Tono colega natural. 6 frases máximo. Una acción concreta para hoy.")
-            reply = ask_claude(MIKI_CHAT_ID, prompt, get_system_chat(), web_data=datos, max_tokens=400)
-            send(MIKI_CHAT_ID, f"🤖 Briefing autónomo:\n\n{reply}")
+            send(MIKI_CHAT_ID, f"🤖 Briefing autónomo · {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+            # 1 tarjeta visual por cada posición principal (estilo del documento de Miki)
+            posiciones_clave = ["GOOGL", "MSFT", "VISA", "AAPL", "JNJ"]
+            for ticker in posiciones_clave:
+                datos = format_data_for_claude(get_real_data(ticker))
+                if "DATOS NO DISPONIBLES" in datos:
+                    continue
+                prompt = (f"Tarjeta visual EXACTA de {ticker} para briefing diario.\n"
+                          f"UNA sola idea principal. Bullets con datos reales del día.\n"
+                          f"Lectura corta. Impacto. Señal final.\n"
+                          f"Si está en máximos, alerta. Si cae fuerte, alerta. Si está estable, mantener.")
+                reply = ask_claude(MIKI_CHAT_ID, prompt, get_system_card(),
+                                   web_data=datos, max_tokens=450)
+                send(MIKI_CHAT_ID, reply)
+                time.sleep(2)  # respiro entre tarjetas
+            # Resumen final estilo colega corto (NO desplaza la plantilla)
+            send(MIKI_CHAT_ID, "👆 Tarjetas de tus posiciones clave de hoy.\n"
+                              "Si quieres valoración profunda con plantilla → \"valórame [TICKER]\"")
         except Exception as e:
             logging.error(f"Autonomy: {e}")
         time.sleep(max(30, AUTONOMY_INTERVAL_MIN) * 60)
@@ -1306,6 +1597,42 @@ def handle(chat_id, text):
             if audio: send_audio(chat_id, audio)
             return
 
+        # ─── EQUIPO JARVIS (subagentes TradingAgents-style) ───
+        # Modo MÁS profundo aún que Dexter: 4 analistas + Bull/Bear + Riesgo + Plantilla
+        EQUIPO_TRIGGERS = [
+            "equipo", "subagentes", "council", "consejo de inversión",
+            "consejo de inversion", "mesa de análisis", "mesa de analisis",
+            "buffett", "lynch", "klarman", "munger",
+            "bull bear", "bull vs bear", "alcista bajista", "debate",
+            "institucional", "buy-side", "buy side",
+            "análisis máximo", "analisis maximo", "análisis total", "analisis total",
+            "research completo", "research total",
+        ]
+        if any(p in txt_low for p in EQUIPO_TRIGGERS):
+            typing(chat_id)
+            send(chat_id, f"🏢 Activando EQUIPO JARVIS COMPLETO para {ticker}...\n"
+                          f"4 analistas + Debate Bull/Bear + Gestores riesgo + Fund Manager.\n"
+                          f"60-90 segundos. Salida: tu PLANTILLA EXACTA + decisión del equipo.")
+            reply = jarvis_team_research(chat_id, ticker, txt)
+            send(chat_id, reply)
+            return
+
+        # ─── DCF CALCULATOR explícito ───
+        DCF_TRIGGERS = ["dcf", "discounted cash flow", "flujo de caja descontado",
+                        "valoración por flujos", "valoracion por flujos"]
+        if any(p in txt_low for p in DCF_TRIGGERS):
+            typing(chat_id)
+            send(chat_id, f"💰 Calculando DCF de {ticker} con 3 escenarios...")
+            dcf_text = dcf_full_analysis(ticker)
+            datos = format_data_for_claude(get_real_data(ticker))
+            prompt = (f"Aquí tienes el DCF calculado de {ticker}:\n\n{dcf_text}\n\n"
+                      f"Datos contexto:\n{datos}\n\n"
+                      f"Comenta el resultado en tono colega: ¿está cara o barata? "
+                      f"¿qué escenario es realista? Termina con DECISIÓN. 5-7 líneas.")
+            reply = ask_claude(chat_id, prompt, get_system_chat(), max_tokens=600)
+            send(chat_id, f"{dcf_text}\n\n{reply}")
+            return
+
         # ─── DEXTER RESEARCH (super cerebro de Jarvis) ───
         # Se activa con CUALQUIER intención de análisis profundo o valoración
         DEXTER_TRIGGERS = [
@@ -1328,9 +1655,36 @@ def handle(chat_id, text):
         if any(p in txt_low for p in DEXTER_TRIGGERS):
             typing(chat_id)
             send(chat_id, f"🧠 Activando DEXTER (super cerebro) para {ticker}...\n"
-                          f"Plan → Datos (FMP+SEC+Insiders+News+Macro) → Reflexión → Plantilla EXACTA.\n"
+                          f"Plan → Datos (FMP+SEC+Insiders+News+Macro+Wiki) → Reflexión → Plantilla EXACTA.\n"
                           f"30-45 segundos.")
             reply = dexter_research(chat_id, ticker, txt)
+            send(chat_id, reply)
+            return
+
+        # ─── EARNINGS / RESULTADOS → TARJETA VISUAL con beat/miss/guidance ───
+        EARNINGS_TRIGGERS = [
+            "earnings", "resultados", "han presentado", "ha presentado",
+            "presenta resultados", "presentó resultados", "presento resultados",
+            "reportado", "reporta", "reportó", "reporto",
+            "beat", "miss", "guidance", "guía", "guia",
+            "ventas trimestre", "trimestre", "q1", "q2", "q3", "q4",
+        ]
+        if any(p in txt_low for p in EARNINGS_TRIGGERS):
+            typing(chat_id)
+            datos = format_data_for_claude(get_real_data(ticker))
+            news = search_news(f"{ticker} earnings revenue EPS guidance Q latest", n=4)
+            sec_data = sec_get_filings(ticker, n=3)
+            full = f"{datos}\n\n=== NOTICIAS RESULTADOS ===\n{news}\n\n{sec_data}"
+            prompt = (f"El usuario pregunta por RESULTADOS / EARNINGS de {ticker}. Hoy {hoy}.\n"
+                      f"Pregunta literal: \"{txt}\"\n\n"
+                      f"Responde con la TARJETA VISUAL EXACTA centrándote en:\n"
+                      f"- Título: RESULTADOS o segmento clave (CLOUD/AZURE/AWS/SEARCH/etc)\n"
+                      f"- Bullets: Ventas (Beat/Miss), EBIT, EPS, Guidance, segmento clave\n"
+                      f"- Lectura: si cambia tesis, si mercado exagera, si problema es negocio o "
+                      f"valoración o timing\n"
+                      f"- Señal final ALINEADA con la cartera de Miki\n\n"
+                      f"Si no hay datos confirmados de earnings recientes, di ⚪ NO CONCLUYENTE.")
+            reply = ask_claude(chat_id, prompt, get_system_card(), web_data=full, max_tokens=700)
             send(chat_id, reply)
             return
 
@@ -1503,7 +1857,7 @@ def handle_image(chat_id, file_id, caption=""):
 # ═════════════════════════════════════════════════════
 def poll():
     offset = 0
-    logging.info(f"JARVIS v13 - {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    logging.info(f"JARVIS v15 - {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     logging.info(f"FMP:{'OK' if FMP_KEY else 'NO'} | "
                  f"Anthropic:{'OK' if ANTHROPIC_KEY else 'NO'} | "
                  f"Whisper:{'OK' if OPENAI_KEY else 'NO'} | "
@@ -1557,59 +1911,305 @@ def poll():
             logging.error(f"Poll: {e}")
 
 # ═════════════════════════════════════════════════════
-#  HTTP SERVER
+#  HTTP SERVER PRO — Web App + API endurecida
+#  /app  → panel HTML para hablar con Jarvis desde navegador
+#  /chat → chat (igual que Telegram)
+#  /quote → datos reales empresa
+#  /portfolio → cartera Miki
+#  /health → ping
 # ═════════════════════════════════════════════════════
+import hmac, urllib.parse
+from collections import deque
+
+APP_API_KEY     = os.environ.get("APP_API_KEY", "").strip()
+AUTH_REQUIRED   = bool(APP_API_KEY)
+RATE_WIN_SEC    = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60"))
+RATE_MAX_REQ    = int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "120"))
+MAX_BODY_BYTES  = 50_000
+MAX_MSG_CHARS   = 8_000
+
+_rate_lock = threading.Lock()
+_rate_bucket = {}
+
+def _is_rate_limited(ip):
+    now = time.time()
+    with _rate_lock:
+        bucket = _rate_bucket.setdefault(ip, [])
+        bucket[:] = [t for t in bucket if now - t <= RATE_WIN_SEC]
+        if len(bucket) >= RATE_MAX_REQ: return True
+        bucket.append(now)
+    return False
+
+JARVIS_APP_HTML = """<!doctype html>
+<html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>JARVIS WebApp</title>
+<style>
+:root{--bg:#0b1020;--panel:#121a33;--panel2:#17213f;--text:#eef3ff;--muted:#9fb0d0;
+--border:#273452;--accent:#4da3ff;--danger:#ff5c7a;--ok:#43d18b}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:radial-gradient(circle at top,#18264b 0,var(--bg) 45%);
+color:var(--text);font-family:Arial,system-ui,sans-serif}
+.wrap{width:min(1100px,calc(100% - 32px));margin:0 auto;padding:32px 0}
+header{margin-bottom:22px}
+h1{margin:0 0 8px;font-size:28px}
+.sub{color:var(--muted);margin:0;font-size:14px}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+section{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--border);
+border-radius:18px;padding:18px;box-shadow:0 16px 40px rgba(0,0,0,.25)}
+h2{margin:0 0 12px;font-size:18px}
+label{display:block;font-size:13px;color:var(--muted);margin-bottom:6px}
+input,textarea{width:100%;border:1px solid var(--border);border-radius:12px;padding:12px;
+background:#0d1428;color:var(--text);outline:none;font-size:15px}
+textarea{min-height:130px;resize:vertical}
+input:focus,textarea:focus{border-color:var(--accent)}
+.row{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+button{border:0;border-radius:12px;padding:11px 14px;background:var(--accent);
+color:white;cursor:pointer;font-weight:700}
+button.secondary{background:#2d3b5f}
+button.danger{background:var(--danger)}
+pre{margin-top:16px;min-height:260px;max-height:520px;overflow:auto;background:#070b16;
+border:1px solid var(--border);color:#dbe7ff;padding:16px;border-radius:18px;
+white-space:pre-wrap;word-break:break-word}
+.status{display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);margin-top:8px}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--ok)}
+@media(max-width:820px){.grid{grid-template-columns:1fr}}
+</style></head><body>
+<div class="wrap">
+<header><h1>🤖 JARVIS WebApp</h1>
+<p class="sub">Versión: __APP_VERSION__</p>
+<div class="status"><span class="dot"></span><span id="statusText">Listo.</span></div></header>
+<div class="grid">
+<section><h2>🔐 Seguridad</h2>
+<label for="apiKey">API Key (opcional)</label>
+<input id="apiKey" type="password" autocomplete="off" placeholder="Pega tu APP_API_KEY">
+<div class="row">
+<button class="secondary" onclick="saveKey()">Guardar</button>
+<button class="danger" onclick="clearKey()">Borrar</button>
+<button onclick="health()">Health</button></div></section>
+<section><h2>📊 Precio</h2>
+<label for="ticker">Ticker</label>
+<input id="ticker" value="MSFT" autocomplete="off">
+<div class="row"><button onclick="quote()">Buscar precio</button></div></section>
+<section><h2>💬 Chat con Jarvis</h2>
+<label for="msg">Mensaje (igual que Telegram)</label>
+<textarea id="msg" placeholder="valórame Google, insiders MSFT, mira mi gmail..."></textarea>
+<div class="row">
+<button onclick="chat()">Enviar</button>
+<button class="secondary" onclick="portfolio()">Cartera</button></div></section>
+<section><h2>📤 Salida</h2><pre id="out">Listo.</pre></section>
+</div></div>
+<script>
+const out=document.getElementById('out'),statusText=document.getElementById('statusText'),
+apiKeyInput=document.getElementById('apiKey'),tickerInput=document.getElementById('ticker'),
+msgInput=document.getElementById('msg');
+apiKeyInput.value=localStorage.getItem('JARVIS_API_KEY')||'';
+function setStatus(t){statusText.textContent=t}
+function show(x){out.textContent=typeof x==='string'?x:JSON.stringify(x,null,2)}
+function saveKey(){localStorage.setItem('JARVIS_API_KEY',apiKeyInput.value.trim());show('API Key guardada.')}
+function clearKey(){localStorage.removeItem('JARVIS_API_KEY');apiKeyInput.value='';show('API Key borrada.')}
+function headers(json=false){const h={};const k=apiKeyInput.value.trim();
+if(json)h['Content-Type']='application/json';if(k)h['X-API-Key']=k;return h}
+async function request(path,opts={}){setStatus('Trabajando...');
+try{const r=await fetch(path,opts);const ct=r.headers.get('content-type')||'';
+const data=ct.includes('application/json')?await r.json():await r.text();
+if(!r.ok){show(data);setStatus('Error.');return data}
+show(data);setStatus('Listo.');return data}
+catch(e){show({error:String(e)});setStatus('Error de conexión.');return{error:String(e)}}}
+async function health(){return request('/health',{method:'GET'})}
+async function quote(){const t=tickerInput.value.trim();if(!t){show({error:'Falta ticker'});return}
+return request('/quote?ticker='+encodeURIComponent(t),{method:'GET',headers:headers(false)})}
+async function portfolio(){return request('/portfolio',{method:'GET',headers:headers(false)})}
+async function chat(){const m=msgInput.value.trim();if(!m){show({error:'Falta mensaje'});return}
+return request('/chat',{method:'POST',headers:headers(true),body:JSON.stringify({message:m,chat_id:'webapp'})})}
+</script></body></html>"""
+
 class H(BaseHTTPRequestHandler):
-    def _send_text(self, code=200):
-        self.send_response(code)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+    server_version = "JARVIS-API-PRO"
+
+    def _client_ip(self):
+        fwd = self.headers.get("X-Forwarded-For", "")
+        if fwd: return fwd.split(",")[0].strip()
+        return self.client_address[0] if self.client_address else "unknown"
+
+    def _common_headers(self, content_type):
+        self.send_header("Content-Type", content_type)
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+
+    def _send(self, code, content_type, payload):
+        self.send_response(code)
+        self._common_headers(content_type)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(payload)
+
+    def _text(self, txt, code=200):
+        self._send(code, "text/plain; charset=utf-8", txt.encode("utf-8"))
+
+    def _html(self, html, code=200):
+        self._send(code, "text/html; charset=utf-8", html.encode("utf-8"))
+
+    def _json(self, obj, code=200):
+        payload = json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8")
+        self._send(code, "application/json; charset=utf-8", payload)
+
+    def _err(self, msg, code):
+        self._json({"ok": False, "error": msg}, code)
+
+    def _authorized(self):
+        if not AUTH_REQUIRED: return True
+        auth = self.headers.get("Authorization", "")
+        api_key = self.headers.get("X-API-Key", "")
+        return (hmac.compare_digest(auth, f"Bearer {APP_API_KEY}") or
+                hmac.compare_digest(api_key, APP_API_KEY))
+
+    def _guard(self, path, protected=False):
+        if _is_rate_limited(self._client_ip()):
+            self._err("rate limit exceeded", 429); return False
+        if protected and not self._authorized():
+            self._err("unauthorized", 401); return False
+        return True
+
+    def _read_json_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except: length = 0
+        if length < 0 or length > MAX_BODY_BYTES:
+            self._err("invalid body", 413); return None
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            body = json.loads(raw or b"{}")
+            if not isinstance(body, dict):
+                self._err("body must be object", 400); return None
+            return body
+        except:
+            self._err("invalid json", 400); return None
+
+    def do_HEAD(self):
+        self._text("", 200)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._common_headers("text/plain; charset=utf-8")
         self.end_headers()
 
     def do_GET(self):
-        self._send_text(200)
-        msg = f"JARVIS v13 - {datetime.now().strftime('%d/%m/%Y %H:%M')} - Online"
-        self.wfile.write(msg.encode("utf-8"))
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            path, qs = parsed.path, urllib.parse.parse_qs(parsed.query)
 
-    def do_HEAD(self):
-        self._send_text(200)
+            if not self._guard(path, protected=False): return
+
+            if path in ("/", "/health"):
+                self._text(f"JARVIS v15 - {datetime.now().strftime('%d/%m/%Y %H:%M')} - Online", 200)
+                return
+
+            if path == "/app":
+                html = JARVIS_APP_HTML.replace("__APP_VERSION__", "JARVIS v15")
+                self._html(html, 200); return
+
+            if path == "/favicon.ico":
+                self._text("", 204); return
+
+            # Endpoints protegidos
+            if path == "/quote":
+                if not self._guard(path, protected=True): return
+                ticker = (qs.get("ticker") or qs.get("symbol") or [""])[0].upper().strip()
+                if not ticker:
+                    self._err("missing ticker", 400); return
+                data = get_real_data(ticker)
+                self._json(data, 200); return
+
+            if path == "/portfolio":
+                if not self._guard(path, protected=True): return
+                tickers = ["GOOGL", "MSFT", "AAPL", "JNJ", "VISA", "SSNC", "TXRH", "CELH"]
+                portfolio = {t: get_real_data(t) for t in tickers}
+                self._json(portfolio, 200); return
+
+            self._err("not found", 404)
+        except Exception as e:
+            logging.error(f"GET {self.path}: {e}")
+            self._err("internal error", 500)
 
     def do_POST(self):
         try:
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length))
-            msg = body.get("message", "")
-            chat_id = body.get("chat_id", "webapp")
-            if not msg: raise ValueError("No message")
-            ticker = detect_ticker(msg)
-            if ticker and not is_conversational(msg):
-                datos = format_data_for_claude(get_real_data(ticker))
-                prompt = f"Pregunta: \"{msg}\". Responde con tarjeta visual."
-                reply = ask_claude(chat_id, prompt, get_system_card(), web_data=datos, max_tokens=600)
-            else:
-                datos = format_data_for_claude(get_real_data(ticker)) if ticker else ""
-                reply = ask_claude(chat_id, msg, get_system_chat(), web_data=datos, max_tokens=500)
-            resp = json.dumps({"reply": reply}, ensure_ascii=False).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(resp)
-        except Exception as e:
-            logging.error(f"POST: {e}")
-            self.send_response(500)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
 
-    def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
+            if not self._guard(path, protected=True): return
+            body = self._read_json_body()
+            if body is None: return
+
+            if path == "/chat":
+                msg = str(body.get("message") or body.get("msg") or "").strip()
+                chat_id = str(body.get("chat_id") or "webapp").strip()[:80]
+                if not msg:
+                    self._err("missing message", 400); return
+                if len(msg) > MAX_MSG_CHARS:
+                    self._err("message too long", 413); return
+
+                # Router IDÉNTICO a Telegram → equipo / dexter / earnings / dcf / tarjeta / chat
+                ticker = detect_ticker(msg)
+                msg_low = msg.lower()
+                if ticker and any(p in msg_low for p in EQUIPO_TRIGGERS_GLOBAL):
+                    reply = jarvis_team_research(chat_id, ticker, msg)
+                elif ticker and any(p in msg_low for p in DCF_TRIGGERS_GLOBAL):
+                    dcf_text = dcf_full_analysis(ticker)
+                    reply = dcf_text
+                elif ticker and any(p in msg_low for p in DEXTER_TRIGGERS_GLOBAL):
+                    reply = dexter_research(chat_id, ticker, msg)
+                elif ticker and is_conversational(msg):
+                    datos = format_data_for_claude(get_real_data(ticker))
+                    reply = ask_claude(chat_id, msg, get_system_chat(), web_data=datos, max_tokens=400)
+                elif ticker:
+                    datos = format_data_for_claude(get_real_data(ticker))
+                    prompt = f"Pregunta: \"{msg}\". Responde con tarjeta visual EXACTA."
+                    reply = ask_claude(chat_id, prompt, get_system_card(), web_data=datos, max_tokens=600)
+                else:
+                    reply = ask_claude(chat_id, msg, get_system_chat(), max_tokens=500)
+                self._json({"ok": True, "reply": reply}, 200); return
+
+            if path == "/quote":
+                ticker = str(body.get("ticker") or body.get("symbol") or "").upper().strip()
+                if not ticker:
+                    self._err("missing ticker", 400); return
+                self._json(get_real_data(ticker), 200); return
+
+            self._err("not found", 404)
+        except Exception as e:
+            logging.error(f"POST {self.path}: {e}")
+            self._err("internal error", 500)
 
     def log_message(self, *a): pass
+
+# Triggers globales accesibles desde web (idénticos a Telegram)
+DEXTER_TRIGGERS_GLOBAL = [
+    "valora", "valoración", "valoracion", "valórame", "valorame",
+    "valuar", "evaluar", "evalúa", "evalua",
+    "plantilla", "invertir desde 0", "invertir desde cero",
+    "precio justo", "valor intrínseco", "valor intrinseco",
+    "precio objetivo", "precio target",
+    "análisis profundo", "analisis profundo", "análisis completo",
+    "analisis completo", "research", "investiga", "estudia",
+    "tesis", "deep dive",
+    "compro o no", "vendo o no", "qué hago con", "que hago con",
+    "merece la pena", "vale la pena", "earnings", "resultados",
+]
+EQUIPO_TRIGGERS_GLOBAL = [
+    "equipo", "subagentes", "council", "consejo de inversión",
+    "consejo de inversion", "mesa de análisis", "mesa de analisis",
+    "buffett", "lynch", "klarman", "munger",
+    "bull bear", "bull vs bear", "alcista bajista", "debate",
+    "institucional", "buy-side", "buy side",
+    "análisis máximo", "analisis maximo", "análisis total", "analisis total",
+    "research completo", "research total",
+]
+DCF_TRIGGERS_GLOBAL = ["dcf", "discounted cash flow", "flujo de caja descontado",
+                       "valoración por flujos", "valoracion por flujos"]
 
 # ═════════════════════════════════════════════════════
 #  ARRANQUE
@@ -1619,6 +2219,9 @@ def main():
     threading.Thread(target=poll, daemon=True).start()
     threading.Thread(target=gmail_monitor_loop, daemon=True).start()
     threading.Thread(target=autonomous_briefing_loop, daemon=True).start()
+    threading.Thread(target=alerts_loop, daemon=True).start()
+    logging.info(f"🌐 WebApp activa en /app | API en /chat /quote /portfolio /health")
+    logging.info(f"🔐 AUTH_REQUIRED={AUTH_REQUIRED} | RATE_LIMIT={RATE_MAX_REQ}/{RATE_WIN_SEC}s")
     HTTPServer(("0.0.0.0", PORT), H).serve_forever()
 
 if __name__ == "__main__":
