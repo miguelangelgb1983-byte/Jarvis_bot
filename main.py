@@ -684,7 +684,7 @@ VISA nueva. NKE vendida.
 - Pregunta puntual: 2-4 frases
 - Conversación: 3-6 frases máximo
 - Resultado Dexter / valoración: las 9 secciones de la plantilla SIN RECORTAR
-""" + (("\n\n═══ SKILLS MODULARES (archivos editables) ═══\n" + load_all_skills()) if load_all_skills() else "")
+""" + (("\n\n═══ SKILLS MODULARES (archivos editables) ═══\n" + load_all_skills()) if load_all_skills() else "") + (("\n\n═══ AUTO-MEJORAS DIARIAS ═══\n" + get_self_prompt()) if get_self_prompt() else "")
 
 # ═════════════════════════════════════════════════════
 #  MEMORIA SQLITE + SUPABASE
@@ -797,6 +797,202 @@ def recent_transactions(limit=8):
             conn.close()
         return rows
     except: return []
+
+# ═════════════════════════════════════════════════════
+#  CARTERA REAL — Tabla jarvis_cartera en Supabase
+#  Auto-actualizable con cada movimiento Gmail detectado
+# ═════════════════════════════════════════════════════
+# Mapeo nombre broker → ticker en cartera
+BROKER_NAME_TO_TICKER = {
+    "alphabet": "GOOGL", "google": "GOOGL", "googl": "GOOGL",
+    "moncler": "MONC", "monc": "MONC",
+    "apple": "AAPL", "aapl": "AAPL",
+    "microsoft": "MSFT", "msft": "MSFT",
+    "msci india": "INDA", "india": "INDA",
+    "texas roadhouse": "TXRH", "txrh": "TXRH",
+    "fidelity s&p": "SP500", "fidelity sp": "SP500", "s&p 500": "SP500",
+    "ishares europe": "EUROPE", "europe index": "EUROPE",
+    "vanguard global small": "SMCAP", "small-cap": "SMCAP", "smallcap": "SMCAP",
+    "johnson": "JNJ", "jnj": "JNJ", "j&j": "JNJ",
+    "ss&c": "SSNC", "ssnc": "SSNC",
+    "zegona": "ZEG", "zeg": "ZEG",
+    "visa": "VISA",
+    "celsius": "CELH", "celh": "CELH",
+    "vaneck": "TRET", "real estate etf": "TRET", "tret": "TRET",
+    "invesco physical gold": "GOLD", "gold etc": "GOLD",
+}
+
+def normalize_to_ticker(text_or_ticker):
+    """Normaliza nombre o ticker libre al ticker oficial de cartera."""
+    if not text_or_ticker: return None
+    t = str(text_or_ticker).strip().upper()
+    # Si ya es ticker conocido
+    known = {"GOOGL","MONC","AAPL","MSFT","INDA","INDIA","TXRH","SP500","EUROPE",
+             "SMCAP","JNJ","SSNC","ZEG","VISA","CELH","TRET","GOLD"}
+    if t in known: return t
+    # Búsqueda por nombre
+    t_low = text_or_ticker.lower()
+    for name, ticker in BROKER_NAME_TO_TICKER.items():
+        if name in t_low:
+            return ticker
+    return None
+
+def cartera_get_all():
+    """Devuelve cartera completa desde Supabase (o lista vacía)."""
+    if not (SUPABASE_URL and SUPABASE_KEY): return []
+    try:
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/jarvis_cartera",
+            headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
+            params={"select": "*", "order": "valor_actual.desc"},
+            timeout=8)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        logging.error(f"Cartera get: {e}")
+    return []
+
+def cartera_summary():
+    """Resumen total de cartera."""
+    if not (SUPABASE_URL and SUPABASE_KEY): return None
+    try:
+        r = requests.post(f"{SUPABASE_URL}/rest/v1/rpc/cartera_summary",
+            headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                     "Content-Type": "application/json"},
+            json={}, timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list) and data: return data[0]
+            if isinstance(data, dict): return data
+    except Exception as e:
+        logging.error(f"Cartera summary: {e}")
+    return None
+
+def cartera_upsert(ticker, **fields):
+    """Inserta o actualiza una posición."""
+    if not (SUPABASE_URL and SUPABASE_KEY): return False
+    fields["ticker"] = ticker.upper()
+    fields["ultima_actualizacion"] = utc_now()
+    try:
+        r = requests.post(f"{SUPABASE_URL}/rest/v1/jarvis_cartera",
+            headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                     "Content-Type": "application/json",
+                     "Prefer": "resolution=merge-duplicates,return=minimal"},
+            json=fields, timeout=8)
+        return r.status_code in (200, 201, 204)
+    except Exception as e:
+        logging.error(f"Cartera upsert: {e}")
+    return False
+
+def aportacion_add(ticker, accion, shares=None, precio=None, importe_eur=None,
+                   broker=None, fecha=None, email_hash=None):
+    """Añade una aportación a la tabla histórica."""
+    if not (SUPABASE_URL and SUPABASE_KEY): return False
+    payload = {
+        "ticker": ticker.upper(),
+        "accion": (accion or "").upper(),
+        "shares": shares, "precio": precio,
+        "importe_eur": importe_eur, "broker": broker,
+        "origen": "gmail" if email_hash else "manual",
+        "email_hash": email_hash,
+    }
+    if fecha: payload["fecha"] = fecha
+    try:
+        r = requests.post(f"{SUPABASE_URL}/rest/v1/jarvis_aportaciones",
+            headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                     "Content-Type": "application/json", "Prefer": "return=minimal"},
+            json={k: v for k, v in payload.items() if v is not None}, timeout=8)
+        return r.status_code in (200, 201, 204)
+    except Exception as e:
+        logging.error(f"Aportación add: {e}")
+    return False
+
+def cartera_apply_movement(mov):
+    """Aplica un movimiento Gmail detectado a la cartera real."""
+    if not mov or "error" in mov: return False
+    ticker = normalize_to_ticker(mov.get("ticker") or mov.get("asunto", ""))
+    if not ticker: return False
+
+    # Guardar histórico siempre
+    aportacion_add(
+        ticker=ticker,
+        accion=mov.get("accion"),
+        importe_eur=mov.get("importe_eur"),
+        broker=mov.get("broker"),
+        fecha=mov.get("fecha"),
+        email_hash=str(abs(hash(str(mov))))
+    )
+
+    # Actualizar valor_actual aproximado (si tenemos importe)
+    accion = (mov.get("accion") or "").upper()
+    importe = mov.get("importe_eur") or 0
+    if importe and accion in ("COMPRA", "INGRESO"):
+        # Sumar al valor actual existente
+        cartera = cartera_get_all()
+        existing = next((p for p in cartera if p["ticker"] == ticker), None)
+        if existing:
+            nuevo_valor = (existing.get("valor_actual") or 0) + importe
+            cartera_upsert(ticker, valor_actual=nuevo_valor,
+                          notas=f"Última compra +{importe:.0f}€ {datetime.now().strftime('%d/%m/%Y')}")
+        else:
+            cartera_upsert(ticker, valor_actual=importe, tipo="accion", moneda="EUR",
+                          notas=f"Posición abierta {datetime.now().strftime('%d/%m/%Y')}")
+    elif importe and accion == "VENTA":
+        cartera = cartera_get_all()
+        existing = next((p for p in cartera if p["ticker"] == ticker), None)
+        if existing:
+            nuevo_valor = max(0, (existing.get("valor_actual") or 0) - importe)
+            cartera_upsert(ticker, valor_actual=nuevo_valor,
+                          notas=f"Última venta -{importe:.0f}€ {datetime.now().strftime('%d/%m/%Y')}")
+    return True
+
+def format_cartera_completa():
+    """Devuelve string formateado con cartera completa + resumen."""
+    cartera = cartera_get_all()
+    if not cartera:
+        return "Cartera vacía. Ejecuta el SQL de Supabase para cargar las posiciones."
+
+    summary = cartera_summary() or {}
+    total = summary.get("total_eur") or 0
+    resultado = summary.get("total_resultado") or 0
+    rent = summary.get("total_rentabilidad_pct") or 0
+    num = summary.get("num_posiciones") or len(cartera)
+
+    out = [f"📊 CARTERA MIKI · {datetime.now().strftime('%d/%m/%Y %H:%M')}"]
+    out.append(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    out.append(f"💰 Total: €{total:,.0f} | Resultado: {resultado:+,.0f}€ ({rent:+.1f}%)")
+    out.append(f"📦 {num} posiciones\n")
+
+    # Agrupar por tipo
+    acciones = [p for p in cartera if p.get("tipo") == "accion"]
+    fondos = [p for p in cartera if p.get("tipo") == "fondo"]
+    etfs = [p for p in cartera if p.get("tipo") in ("etf", "etc")]
+
+    def fmt_pos(p):
+        sym = "🟢" if (p.get("resultado_eur") or 0) >= 0 else "🔴"
+        moneda = p.get("moneda", "EUR")
+        simbolo = "€" if moneda == "EUR" else ("$" if moneda == "USD" else moneda)
+        valor = p.get("valor_actual") or 0
+        res = p.get("resultado_eur") or 0
+        nombre = p.get("nombre") or p.get("ticker")
+        notas = p.get("notas") or ""
+        line = f"{sym} {nombre:30} {simbolo}{valor:,.0f}  ({res:+,.0f})"
+        if notas: line += f" · {notas[:40]}"
+        return line
+
+    if acciones:
+        out.append("📈 ACCIONES:")
+        for p in sorted(acciones, key=lambda x: -(x.get("valor_actual") or 0)):
+            out.append("  " + fmt_pos(p))
+    if fondos:
+        out.append("\n💼 FONDOS:")
+        for p in sorted(fondos, key=lambda x: -(x.get("valor_actual") or 0)):
+            out.append("  " + fmt_pos(p))
+    if etfs:
+        out.append("\n🏛️ ETFs:")
+        for p in sorted(etfs, key=lambda x: -(x.get("valor_actual") or 0)):
+            out.append("  " + fmt_pos(p))
+
+    return "\n".join(out)
 
 def save_memory(chat_id, role, content):
     save_memory_local(chat_id, role, content)
@@ -953,41 +1149,685 @@ def format_semantic_recalls(recalls):
 #  AUTO-LEARNING — Jarvis aprende de cada conversación
 # ═════════════════════════════════════════════════════
 def auto_learn_from_conversation(chat_id, user_msg, assistant_reply):
-    """Extrae aprendizajes nuevos sobre Miki y los guarda en knowledge."""
+    """
+    Extrae aprendizajes nuevos sobre Miki y los guarda.
+    Estilo mem0: múltiples facts categorizados por turno.
+    """
     if not ANTHROPIC_KEY: return
-    if len(user_msg) < 30: return  # mensajes muy cortos no aportan
+    if len(user_msg) < 30: return
 
     prompt = (
-        f"Eres el meta-cerebro de Jarvis. Analiza este intercambio reciente:\n\n"
-        f"MIKI: {user_msg[:600]}\n"
-        f"JARVIS: {assistant_reply[:600]}\n\n"
-        f"¿Hay algo NUEVO sobre Miki que Jarvis deba recordar PARA SIEMPRE?\n"
-        f"Por ejemplo: una nueva preferencia, una posición que abrió, una idea de inversión, "
-        f"un cambio en su estrategia, una empresa que está siguiendo, una restricción suya.\n\n"
-        f"Responde EXACTAMENTE con uno de estos dos formatos:\n"
-        f"A) Si NO hay nada nuevo importante → responde solo: NO\n"
-        f"B) Si SÍ hay algo nuevo → responde: SI|<categoría>|<frase corta del aprendizaje>\n"
-        f"     Categorías: posicion, preferencia, estrategia, restriccion, idea, contacto, otro\n"
-        f"     Ejemplo: SI|posicion|Miki ha abierto posición en NVDA por 500€"
+        f"Eres el meta-cerebro de Jarvis (estilo mem0). Analiza este intercambio:\n\n"
+        f"MIKI: {user_msg[:800]}\n"
+        f"JARVIS: {assistant_reply[:800]}\n\n"
+        f"Extrae HASTA 3 hechos NUEVOS importantes sobre Miki que valga recordar SIEMPRE.\n"
+        f"Categorías permitidas:\n"
+        f"  - posicion (compras/ventas/cambios cartera)\n"
+        f"  - preferencia (cómo le gusta que Jarvis responda, formato, tono)\n"
+        f"  - estrategia (filosofía inversión, value investing, criterios decisión)\n"
+        f"  - restriccion (cosas que NO quiere, límites)\n"
+        f"  - idea (empresas que estudia, oportunidades)\n"
+        f"  - emocion (estado de ánimo, preocupaciones, contexto vital)\n"
+        f"  - dato_personal (info de Miki como inversor)\n\n"
+        f"Formato de salida (UNA línea por hecho, sin más texto):\n"
+        f"NO  → si no hay nada importante\n"
+        f"SI|categoria|frase corta y específica\n"
+        f"SI|categoria|frase corta y específica\n"
+        f"SI|categoria|frase corta y específica\n\n"
+        f"Reglas:\n"
+        f"- NO repitas lo que Jarvis ya sabe (cartera, cuenta, plantilla, etc.)\n"
+        f"- SOLO hechos NUEVOS o cambios.\n"
+        f"- Frases concretas, no abstractas."
     )
     try:
         result = claude_call(
-            "Extractor de aprendizajes para meta-memoria de Jarvis. Conciso, español.",
-            prompt, max_tokens=150
+            "Extractor de meta-memoria estilo mem0. Conciso, español, sin paja.",
+            prompt, max_tokens=300
         )
-        if not result or result.strip().upper().startswith("NO"): return
-        if "|" in result:
-            parts = result.split("|", 2)
-            if len(parts) >= 3:
-                categoria = parts[1].strip().lower()[:40]
-                aprendizaje = parts[2].strip()[:400]
-                if aprendizaje and len(aprendizaje) > 8:
-                    key = f"auto_{categoria}_{int(time.time())}"
-                    upsert_knowledge(chat_id, key, aprendizaje)
-                    save_semantic(chat_id, aprendizaje, importance=8, tags=f"auto,{categoria}")
-                    logging.info(f"[AUTO-LEARN] {chat_id}: {categoria} → {aprendizaje[:80]}")
+        if not result: return
+        if result.strip().upper().startswith("NO"): return
+
+        learned = 0
+        for line in result.strip().split("\n"):
+            line = line.strip()
+            if not line.startswith("SI|"): continue
+            parts = line.split("|", 2)
+            if len(parts) < 3: continue
+            categoria = parts[1].strip().lower()[:40]
+            aprendizaje = parts[2].strip()[:400]
+            if aprendizaje and len(aprendizaje) > 8:
+                key = f"auto_{categoria}_{int(time.time())}_{learned}"
+                upsert_knowledge(chat_id, key, aprendizaje)
+                save_semantic(chat_id, aprendizaje, importance=8, tags=f"auto,{categoria}")
+                logging.info(f"[AUTO-LEARN-MEM0] {chat_id}: {categoria} → {aprendizaje[:80]}")
+                learned += 1
+                if learned >= 3: break
     except Exception as e:
-        logging.error(f"Auto-learn: {e}")
+        logging.error(f"Auto-learn mem0: {e}")
+
+# ═════════════════════════════════════════════════════
+#  CONTEXT COMPRESSION (estilo Context7)
+#  Cuando hay muchos recuerdos L2, los compactamos antes de meter en prompt
+# ═════════════════════════════════════════════════════
+def compress_context(recalls, max_tokens_approx=800):
+    """Compacta una lista de recuerdos en un resumen denso."""
+    if not recalls: return ""
+    if len(recalls) <= 3:
+        return format_semantic_recalls(recalls)
+
+    # Estimar tokens (aprox 4 chars por token)
+    total_chars = sum(len(r.get("content", "")) for r in recalls)
+    if total_chars < max_tokens_approx * 4:
+        return format_semantic_recalls(recalls)
+
+    # Comprimir con Claude
+    raw = "\n".join([f"[{r.get('created_at','')[:10]}] {r.get('content','')[:300]}"
+                     for r in recalls[:10]])
+    summary = claude_call(
+        "Compresor de memoria. Resume sin perder hechos clave.",
+        f"Resume estos recuerdos en máximo 6 puntos cortos, sin perder fechas ni cifras "
+        f"importantes:\n\n{raw}",
+        max_tokens=400
+    )
+    if summary:
+        return f"RECUERDOS COMPACTADOS L2:\n{summary}"
+    return format_semantic_recalls(recalls)
+
+
+# ═════════════════════════════════════════════════════
+#  AUTO-MEJORA DIARIA — Jarvis se prompt-engineer a sí mismo
+#  Cada noche analiza últimas 50 convs y genera addendum a system prompt
+# ═════════════════════════════════════════════════════
+SELF_PROMPT_PATH = "JARVIS_SELF_PROMPT.md"
+
+def get_self_prompt():
+    """Lee el addendum auto-generado de auto-mejoras pasadas."""
+    p = Path(SELF_PROMPT_PATH)
+    if p.exists():
+        try: return p.read_text(encoding="utf-8").strip()
+        except: pass
+    return ""
+
+def jarvis_self_improve():
+    """
+    Cada noche: Jarvis lee sus últimas conversaciones, detecta patrones,
+    errores, preferencias nuevas de Miki, y AUTO-GENERA mejoras a su prompt.
+    """
+    if not (ANTHROPIC_KEY and MIKI_CHAT_ID):
+        logging.info("Self-improve: faltan vars, omitido")
+        return
+
+    try:
+        # 1) Recoger últimas 50 conversaciones
+        with memory_lock:
+            conn = _memory_conn()
+            rows = conn.execute("""SELECT role, content, created_at FROM jarvis_memory_local
+                WHERE chat_id=? ORDER BY id DESC LIMIT 100""", (str(MIKI_CHAT_ID),)).fetchall()
+            conn.close()
+
+        if len(rows) < 10:
+            logging.info("Self-improve: pocas convs, omitido")
+            return
+
+        # Formatear para análisis
+        convs = "\n".join([f"[{r[2][:10]}] {r[0].upper()}: {r[1][:300]}" for r in rows[::-1]])
+
+        # 2) Recoger learnings recientes
+        learnings = list_knowledge(MIKI_CHAT_ID, limit=20)
+        learnings_txt = "\n".join([f"- {k}: {v}" for k, v in learnings]) if learnings else "Ninguno"
+
+        # 3) Prompt de auto-análisis (estilo Superpowers + Claude-Mem)
+        analysis_prompt = (
+            f"Eres el META-ANALIZADOR de Jarvis. Tu trabajo es revisar las últimas 50 "
+            f"conversaciones con Miki y AUTO-MEJORAR el prompt de Jarvis para mañana.\n\n"
+            f"═══ CONVERSACIONES RECIENTES ═══\n{convs[:8000]}\n\n"
+            f"═══ APRENDIZAJES YA REGISTRADOS ═══\n{learnings_txt}\n\n"
+            f"═══ TU TAREA ═══\n"
+            f"Identifica:\n"
+            f"1) ¿Qué patrones de fallo hubo? (Jarvis dio info incorrecta, malinterpretó, etc)\n"
+            f"2) ¿Qué preferencias NUEVAS muestra Miki? (formato, longitud, tono)\n"
+            f"3) ¿Qué temas/empresas le interesan más últimamente?\n"
+            f"4) ¿Qué cosas Jarvis hizo BIEN que debe mantener/reforzar?\n\n"
+            f"Genera un ADDENDUM al system prompt en formato MD, máximo 400 palabras, "
+            f"con la sección '═══ APRENDIZAJES META-AUTO (actualizado {datetime.now().strftime('%d/%m/%Y')}) ═══'\n"
+            f"y bullets concretos accionables. NO repitas lo que ya está. SOLO añade lo NUEVO.\n\n"
+            f"Si no hay nada relevante que añadir → responde solo: SIN_CAMBIOS"
+        )
+
+        result = claude_call(
+            "Meta-analizador silencioso de Jarvis. Honesto, conciso, español.",
+            analysis_prompt, max_tokens=800
+        )
+
+        if not result or "SIN_CAMBIOS" in result.upper():
+            logging.info("[SELF-IMPROVE] Sin cambios necesarios hoy")
+            return
+
+        # 4) Guardar el addendum
+        existing = get_self_prompt()
+        new_content = result.strip()
+
+        if existing:
+            # Mantener histórico, añadir nuevo arriba
+            full = f"{new_content}\n\n---\n\n{existing}"
+            # Limitar a últimos 5 ciclos (8000 chars máx)
+            if len(full) > 8000:
+                full = full[:8000]
+        else:
+            full = new_content
+
+        try:
+            Path(SELF_PROMPT_PATH).write_text(full, encoding="utf-8")
+            logging.info(f"[SELF-IMPROVE] Addendum actualizado: {len(new_content)} chars")
+            # Avisar a Miki
+            send(MIKI_CHAT_ID,
+                 f"🧠 Auto-mejora completada · {datetime.now().strftime('%d/%m/%Y %H:%M')}\n\n"
+                 f"He analizado nuestras últimas conversaciones y he aprendido cosas nuevas. "
+                 f"Mañana respondo mejor.")
+        except Exception as e:
+            logging.error(f"Self-improve write: {e}")
+
+    except Exception as e:
+        logging.error(f"Self-improve: {e}")
+
+def self_improve_loop():
+    """Loop nocturno: cada día a las 03:00 España."""
+    if not MIKI_CHAT_ID: return
+    time.sleep(300)  # esperar 5 min al arrancar
+    while True:
+        try:
+            now = datetime.now()
+            # 03:00 España todos los días
+            if now.hour == 3 and 0 <= now.minute < 30:
+                jarvis_self_improve()
+                time.sleep(1800)  # evitar doble ejecución
+        except Exception as e:
+            logging.error(f"Self-improve loop: {e}")
+        time.sleep(600)  # check cada 10 min
+
+# ═════════════════════════════════════════════════════
+#  MEMORIA GRAFO (estilo LightRAG)
+#  Extrae entidades de cada conversación y las relaciona
+# ═════════════════════════════════════════════════════
+def extract_entities(text):
+    """Extrae tickers, brokers, fechas, conceptos clave de un texto."""
+    if not text or len(text) < 10: return {}
+    entities = {"tickers": [], "amounts": [], "dates": [], "actions": []}
+    # Tickers (mayúsculas 2-6 letras)
+    ticker_re = re.compile(r'\b([A-Z]{2,6})\b')
+    candidates = ticker_re.findall(text)
+    known = {"GOOGL","MONC","AAPL","MSFT","INDA","TXRH","SP500","EUROPE","SMCAP",
+             "JNJ","SSNC","ZEG","VISA","CELH","TRET","GOLD","NKE","NVDA","AMZN",
+             "META","TSLA","JPM","BRK","SPY","QQQ","V","MA"}
+    entities["tickers"] = list(set([c for c in candidates if c in known]))
+    # Importes EUR/USD
+    amt_re = re.compile(r'(\d+[.,]?\d*)\s*(€|\$|EUR|USD|euros|dolares)', re.IGNORECASE)
+    entities["amounts"] = [m.group(0) for m in amt_re.finditer(text)][:5]
+    # Fechas
+    date_re = re.compile(r'\b\d{1,2}[/\-]\d{1,2}([/\-]\d{2,4})?\b')
+    entities["dates"] = date_re.findall(text)[:3]
+    # Acciones value investing
+    action_words = ["compra", "venta", "vendido", "comprado", "valoración",
+                    "earnings", "resultados", "tesis", "investiga"]
+    entities["actions"] = [w for w in action_words if w in text.lower()]
+    return entities
+
+# ═════════════════════════════════════════════════════
+#  STRUCTURED THINKING (estilo Superpowers)
+#  Antes de cualquier valoración, Jarvis genera plan interno
+# ═════════════════════════════════════════════════════
+def structured_thinking_plan(ticker, user_question):
+    """Genera plan interno estructurado antes de valorar (no se muestra al user)."""
+    if not ANTHROPIC_KEY: return ""
+    try:
+        plan = claude_call(
+            "Planificador interno silencioso de Jarvis. NO se muestra al usuario.",
+            f"Pregunta: \"{user_question}\" sobre {ticker}.\n\n"
+            f"Genera un plan ESTRUCTURADO de 5 pasos máximo:\n"
+            f"1. ¿Qué tipo de empresa es? (tech / mature / commodity / REIT / etc)\n"
+            f"2. ¿Qué métricas son CRÍTICAS para este sector?\n"
+            f"3. ¿Qué fuentes de datos uso? (FMP / SEC / OpenInsider / FRED / News)\n"
+            f"4. ¿Qué red flags vigilar específicamente para esta empresa?\n"
+            f"5. ¿Qué decisión final espera Miki? (compra / vigila / vende)\n\n"
+            f"Responde con bullets ultra cortos. Máximo 200 palabras.",
+            max_tokens=350
+        )
+        return plan or ""
+    except: return ""
+
+# ═════════════════════════════════════════════════════
+#  MÓDULOS VALUE INVESTING (estilo FinceptTerminal)
+# ═════════════════════════════════════════════════════
+def magic_formula_score(roic_pct, earnings_yield_pct):
+    """
+    Magic Formula Greenblatt: combina ROIC + Earnings Yield.
+    Score más bajo = mejor (ranking combinado).
+    """
+    if not (roic_pct and earnings_yield_pct): return None
+    # Aproximación: score = (1/ROIC + 1/EY) * 100, menor = mejor
+    if roic_pct <= 0 or earnings_yield_pct <= 0: return None
+    return round((1/roic_pct + 1/earnings_yield_pct) * 100, 2)
+
+def piotroski_f_score(data):
+    """
+    Piotroski F-Score: 9 puntos de calidad financiera.
+    9 = empresa muy sólida. 0-3 = en problemas.
+    Calcula con datos disponibles, devuelve None si faltan demasiados.
+    """
+    if not data: return None
+    score = 0
+    checks = 0
+    # Rentabilidad (4 puntos)
+    if data.get("net_income") is not None:
+        checks += 1
+        if data["net_income"] > 0: score += 1
+    if data.get("free_cash_flow") is not None:
+        checks += 1
+        if data["free_cash_flow"] > 0: score += 1
+    if data.get("roa") is not None:
+        checks += 1
+        if data["roa"] > 0: score += 1
+    if data.get("free_cash_flow") and data.get("net_income"):
+        checks += 1
+        if data["free_cash_flow"] > data["net_income"]: score += 1
+    # Apalancamiento/liquidez (3 puntos aprox)
+    if data.get("debt_to_equity") is not None:
+        checks += 1
+        if data["debt_to_equity"] < 1.0: score += 1
+    if data.get("current_ratio") is not None:
+        checks += 1
+        if data["current_ratio"] > 1.0: score += 1
+    # Eficiencia operativa (2 puntos aprox)
+    if data.get("gross_margin") is not None:
+        checks += 1
+        if data["gross_margin"] > 0.20: score += 1
+    if data.get("asset_turnover") is not None:
+        checks += 1
+        if data["asset_turnover"] > 0.5: score += 1
+    if checks < 4: return None  # muy pocos datos
+    return {"score": score, "max": checks, "interpretation":
+            "FUERTE" if score >= 7 else ("OK" if score >= 5 else "DÉBIL")}
+
+def altman_z_score(working_capital, retained_earnings, ebit, market_cap,
+                   total_liabilities, total_assets, sales):
+    """
+    Altman Z-Score: predice riesgo bancarrota.
+    Z > 2.99: SAFE
+    Z 1.81-2.99: GREY ZONE
+    Z < 1.81: DISTRESS
+    """
+    try:
+        if not all([total_assets, total_liabilities]): return None
+        a = (working_capital or 0) / total_assets
+        b = (retained_earnings or 0) / total_assets
+        c = (ebit or 0) / total_assets
+        d = (market_cap or 0) / total_liabilities
+        e = (sales or 0) / total_assets
+        z = 1.2*a + 1.4*b + 3.3*c + 0.6*d + 1.0*e
+        zone = "SAFE" if z > 2.99 else ("GREY" if z > 1.81 else "DISTRESS")
+        return {"z": round(z, 2), "zone": zone}
+    except: return None
+
+def graham_number(eps, book_value_per_share):
+    """
+    Graham Number: valor intrínseco máximo conservador.
+    Fórmula: sqrt(22.5 * EPS * BVPS)
+    """
+    try:
+        if not (eps and book_value_per_share): return None
+        if eps <= 0 or book_value_per_share <= 0: return None
+        import math
+        return round(math.sqrt(22.5 * eps * book_value_per_share), 2)
+    except: return None
+
+def value_investing_full_analysis(ticker):
+    """Aplica TODOS los módulos value investing a un ticker."""
+    data = get_real_data(ticker)
+    if data.get("error") or data.get("_fallback") or data.get("is_european"):
+        return f"Análisis value no disponible: faltan datos completos FMP."
+
+    out = [f"📊 ANÁLISIS VALUE INVESTING — {ticker}"]
+    out.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    # Magic Formula
+    pe = data.get("pe")
+    roic = data.get("roic_pct") or (data.get("roic") * 100 if data.get("roic") else None)
+    if pe and roic:
+        ey = (1/pe) * 100  # earnings yield
+        mf = magic_formula_score(roic, ey)
+        if mf:
+            out.append(f"🎯 Magic Formula (Greenblatt): {mf} (menor = mejor)")
+            out.append(f"   ROIC: {roic:.1f}% | Earnings Yield: {ey:.1f}%")
+
+    # Piotroski
+    f = piotroski_f_score(data)
+    if f:
+        out.append(f"📋 Piotroski F-Score: {f['score']}/{f['max']} → {f['interpretation']}")
+
+    # Altman Z (si hay datos)
+    z = altman_z_score(
+        data.get("working_capital"), data.get("retained_earnings"),
+        data.get("ebit"), data.get("market_cap"),
+        data.get("total_liabilities"), data.get("total_assets"),
+        data.get("revenue")
+    )
+    if z:
+        out.append(f"⚠️  Altman Z-Score: {z['z']} → {z['zone']}")
+
+    # Graham Number
+    eps = data.get("eps")
+    bvps = data.get("book_value_per_share")
+    if eps and bvps:
+        gn = graham_number(eps, bvps)
+        if gn:
+            price = data.get("price", 0)
+            margen = ((gn - price) / gn * 100) if gn else 0
+            out.append(f"📐 Graham Number: ${gn} (precio actual ${price:.2f}, margen {margen:+.1f}%)")
+
+    if len(out) == 2:
+        return f"Faltan datos FMP para análisis value completo de {ticker}."
+    return "\n".join(out)
+
+
+# ═════════════════════════════════════════════════════
+#  INSTINCTS (estilo everything-claude-code)
+#  Auto-detección de patrones sospechosos en tiempo real
+# ═════════════════════════════════════════════════════
+def detect_instincts(ticker, data):
+    """
+    Genera lista de 'instintos' automáticos sobre los datos.
+    Devuelve avisos que Jarvis incluye en sus respuestas.
+    """
+    if not data or data.get("error"): return []
+    instincts = []
+
+    pe = data.get("pe")
+    roe = data.get("roe_pct") or (data.get("roe", 0) * 100 if data.get("roe") else None)
+    roic = data.get("roic_pct") or (data.get("roic", 0) * 100 if data.get("roic") else None)
+    fcf = data.get("free_cash_flow") or data.get("fcf_per_share")
+    ni = data.get("net_income")
+    debt_eq = data.get("debt_to_equity")
+    margin_op = data.get("operating_margin_pct") or (data.get("operating_margin", 0) * 100 if data.get("operating_margin") else None)
+    pct_52w = data.get("pct_52w") or data.get("rango_52s_pct")
+    change = data.get("change_pct")
+
+    # Instinct 1: Value trap (PE bajo + ROE bajo + deuda alta)
+    if pe and roe and pe < 12 and roe < 8 and debt_eq and debt_eq > 1.5:
+        instincts.append("⚠️ POSIBLE VALUE TRAP: PE bajo + ROE bajo + deuda alta")
+
+    # Instinct 2: Calidad earnings sospechosa (FCF < Net Income)
+    if fcf and ni and ni > 0 and fcf < ni * 0.7:
+        instincts.append("⚠️ FCF muy por debajo de Net Income → calidad earnings sospechosa")
+
+    # Instinct 3: Acción tocando techo
+    if pct_52w and pct_52w > 95:
+        instincts.append("📈 En zona de máximos 52s → cuidado momentum")
+
+    # Instinct 4: Acción en mínimos
+    if pct_52w and pct_52w < 10:
+        instincts.append("📉 En zona de mínimos 52s → posible oportunidad o trampa")
+
+    # Instinct 5: Caída fuerte hoy
+    if change and change <= -5:
+        instincts.append(f"🔴 Cae {change:.2f}% hoy → revisar noticias")
+
+    # Instinct 6: Subida fuerte hoy
+    if change and change >= 7:
+        instincts.append(f"🟢 Sube {change:.2f}% hoy → revisar noticias / catalyst")
+
+    # Instinct 7: ROIC excelente (excepcional)
+    if roic and roic > 25:
+        instincts.append(f"💎 ROIC {roic:.1f}% → moat excepcional (raro)")
+
+    # Instinct 8: Margen pornográfico
+    if margin_op and margin_op > 50:
+        instincts.append(f"💰 Margen op {margin_op:.1f}% → pricing power brutal")
+
+    # Instinct 9: Datos sospechosos
+    if pe and (pe < 0 or pe > 200):
+        instincts.append(f"❓ PE {pe:.1f} sospechoso → verificar")
+
+    return instincts
+
+def format_instincts(instincts):
+    """Formatea los instintos para inyectar en respuestas."""
+    if not instincts: return ""
+    return "🧠 INSTINTOS JARVIS:\n" + "\n".join([f"  {i}" for i in instincts])
+
+# ═════════════════════════════════════════════════════
+#  RED FLAGS DETECTOR (filosofía Buffett/Klarman)
+#  10 alertas automáticas de calidad
+# ═════════════════════════════════════════════════════
+def detect_red_flags(ticker, data, sec_data=""):
+    """
+    Detecta red flags clásicos value investing.
+    Devuelve lista de problemas detectados.
+    """
+    flags = []
+    if not data or data.get("error"): return flags
+
+    debt_eq = data.get("debt_to_equity")
+    debt_ebitda = data.get("debt_to_ebitda")
+    fcf = data.get("free_cash_flow") or data.get("fcf_per_share")
+    ni = data.get("net_income")
+    capex = data.get("capex")
+    op_cf = data.get("operating_cash_flow")
+    wc = data.get("working_capital")
+    margin_op = data.get("operating_margin_pct") or (data.get("operating_margin", 0) * 100 if data.get("operating_margin") else None)
+    margin_op_prev = data.get("operating_margin_prev_pct")
+    goodwill = data.get("goodwill")
+    ta = data.get("total_assets")
+    roe = data.get("roe_pct") or (data.get("roe", 0) * 100 if data.get("roe") else None)
+    roe_3y_avg = data.get("roe_3y_avg_pct")
+
+    # Flag 1: Deuda/EBITDA peligrosa
+    if debt_ebitda and debt_ebitda > 5:
+        flags.append(f"🚩 Deuda/EBITDA: {debt_ebitda:.1f}x (>5x peligroso)")
+
+    # Flag 2: D/E muy alto
+    if debt_eq and debt_eq > 2.5:
+        flags.append(f"🚩 Deuda/Equity: {debt_eq:.1f} (apalancado)")
+
+    # Flag 3: FCF < Net Income (calidad)
+    if fcf and ni and ni > 0 and fcf < ni * 0.6:
+        flags.append("🚩 FCF muy por debajo de Net Income (earnings poco respaldados)")
+
+    # Flag 4: CapEx > Operating CF
+    if capex and op_cf and abs(capex) > op_cf:
+        flags.append("🚩 CapEx > Operating CF (necesita financiación externa)")
+
+    # Flag 5: Working capital negativo
+    if wc is not None and wc < 0:
+        flags.append("🚩 Working capital negativo (estrés liquidez)")
+
+    # Flag 6: Margen operativo cayendo
+    if margin_op and margin_op_prev and margin_op < margin_op_prev - 3:
+        flags.append(f"🚩 Margen op cayendo: {margin_op_prev:.1f}% → {margin_op:.1f}%")
+
+    # Flag 7: Goodwill excesivo
+    if goodwill and ta and (goodwill / ta) > 0.4:
+        flags.append("🚩 Goodwill > 40% activos (riesgo writedown)")
+
+    # Flag 8: ROE deteriorando
+    if roe and roe_3y_avg and roe < roe_3y_avg - 5:
+        flags.append(f"🚩 ROE deteriorando: 3y avg {roe_3y_avg:.1f}% → actual {roe:.1f}%")
+
+    # Flag 9: 8-K reciente (puede ser problema)
+    if sec_data and "8-K" in sec_data:
+        recent_8k_count = sec_data.count("8-K")
+        if recent_8k_count >= 2:
+            flags.append(f"🚩 {recent_8k_count} formularios 8-K recientes (revisar)")
+
+    # Flag 10: Forma 4 con ventas masivas insiders
+    if sec_data and "Form 4" in sec_data and "sale" in sec_data.lower():
+        flags.append("🚩 Insiders vendiendo (Form 4 con sales)")
+
+    return flags
+
+def format_red_flags(flags):
+    if not flags: return "✅ Sin red flags detectados."
+    return "⚠️ RED FLAGS DETECTADAS:\n" + "\n".join([f"  {f}" for f in flags])
+
+# ═════════════════════════════════════════════════════
+#  SPECIALIST AGENTS (estilo claude-agent-blueprints)
+#  Agentes según tipo de empresa
+# ═════════════════════════════════════════════════════
+def detect_company_type(ticker, data):
+    """Detecta el tipo de empresa para usar el specialist correcto."""
+    if not data: return "generic"
+    ticker = ticker.upper()
+
+    # REIT explícitos
+    if ticker in {"TRET", "VNQ", "O", "REET", "SPG"} or "REIT" in str(data.get("sector", "")).upper():
+        return "reit"
+
+    # Commodities / Gold
+    if ticker in {"GOLD", "GLD", "IAU", "SLV"}:
+        return "commodity"
+
+    # ETFs / Fondos
+    if ticker in {"SP500", "EUROPE", "SMCAP", "INDIA", "INDA", "IVV", "VOO", "QQQ"}:
+        return "etf"
+
+    # Tech alto crecimiento
+    sector = str(data.get("sector", "")).lower()
+    if "technology" in sector or "communication" in sector or "software" in sector:
+        return "tech"
+
+    # Defensivos / Healthcare / Consumer
+    if any(s in sector for s in ["healthcare", "consumer", "utility", "staple"]):
+        return "mature"
+
+    return "generic"
+
+def specialist_analysis(ticker, data, company_type=None):
+    """Análisis especializado según tipo de empresa."""
+    if not company_type:
+        company_type = detect_company_type(ticker, data)
+
+    specialists = {
+        "tech": "Especialista TECH/GROWTH. Foco: FCF, EV/FCF (no PER), tasa crecimiento, "
+                "moat tecnológico, opcionalidad. NO uses DCF tradicional.",
+        "mature": "Especialista EMPRESAS MADURAS. Foco: DCF, dividend yield, payout ratio, "
+                  "consistencia FCF, ROIC sostenido, capital allocation.",
+        "reit": "Especialista REIT. Foco: FFO/AFFO (no PER), cap rate, NAV/share, "
+                "ocupación, leverage (LTV), spreads vs bono 10y.",
+        "commodity": "Especialista COMMODITIES. Foco: precio subyacente, supply/demand, "
+                     "ciclo, costes producción, posición curva.",
+        "etf": "Especialista ETFs/FONDOS. Foco: holdings principales, expense ratio, "
+               "tracking error, exposición sectorial/geográfica.",
+        "generic": "Analista value investing general. Foco: calidad, valoración, riesgos."
+    }
+    return specialists.get(company_type, specialists["generic"])
+
+# ═════════════════════════════════════════════════════
+#  PORTFOLIO HEALTH CHECK
+#  Revisa TODA la cartera y da diagnóstico
+# ═════════════════════════════════════════════════════
+def portfolio_health_check():
+    """Diagnóstico completo de salud de la cartera."""
+    cartera = cartera_get_all()
+    if not cartera: return "Cartera vacía o no accesible."
+
+    total = sum(p.get("valor_actual") or 0 for p in cartera)
+    if total == 0: return "Cartera con valor 0."
+
+    out = [f"🏥 HEALTH CHECK CARTERA · {datetime.now().strftime('%d/%m/%Y')}"]
+    out.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    out.append(f"💰 Total: €{total:,.0f}")
+
+    # 1) Concentración
+    out.append("\n📊 CONCENTRACIÓN:")
+    sorted_cart = sorted(cartera, key=lambda x: -(x.get("valor_actual") or 0))
+    for p in sorted_cart[:5]:
+        pct = (p.get("valor_actual") or 0) / total * 100
+        warn = " ⚠️" if pct > 20 else ""
+        out.append(f"  - {p.get('nombre','?')[:25]:25} {pct:5.1f}%{warn}")
+
+    # 2) Tipos
+    out.append("\n📦 DISTRIBUCIÓN POR TIPO:")
+    tipos = {}
+    for p in cartera:
+        tipo = p.get("tipo", "otro")
+        tipos[tipo] = tipos.get(tipo, 0) + (p.get("valor_actual") or 0)
+    for tipo, valor in sorted(tipos.items(), key=lambda x: -x[1]):
+        pct = valor / total * 100
+        out.append(f"  - {tipo:10}: €{valor:>8,.0f} ({pct:5.1f}%)")
+
+    # 3) Posiciones perdiendo
+    out.append("\n📉 POSICIONES EN PÉRDIDA:")
+    perdidas = [p for p in cartera if (p.get("resultado_eur") or 0) < 0]
+    if perdidas:
+        for p in perdidas:
+            out.append(f"  - {p.get('nombre','?')[:25]:25} {p.get('resultado_eur',0):+,.0f}€ "
+                      f"· {p.get('notas','')[:30]}")
+    else:
+        out.append("  ✅ Todas en positivo")
+
+    # 4) Top performers
+    out.append("\n📈 TOP PERFORMERS:")
+    for p in sorted(cartera, key=lambda x: -(x.get("resultado_eur") or 0))[:3]:
+        if (p.get("resultado_eur") or 0) > 0:
+            out.append(f"  - {p.get('nombre','?')[:25]:25} +{p.get('resultado_eur',0):,.0f}€")
+
+    # 5) Diagnóstico general
+    out.append("\n💡 DIAGNÓSTICO:")
+    if any(((p.get("valor_actual") or 0) / total) > 0.20 for p in cartera):
+        out.append("  ⚠️ Hay posición(es) con >20% peso → considerar reducir concentración")
+    if len([p for p in cartera if p.get("tipo") == "accion"]) < 5:
+        out.append("  ⚠️ Pocas acciones individuales → diversificar más")
+    if not any(p.get("ticker") in {"GOLD", "TRET"} for p in cartera):
+        out.append("  💭 Sin exposición a oro/RE → ¿quieres cobertura?")
+    if len(perdidas) > len(cartera) * 0.5:
+        out.append("  🔴 Más del 50% en pérdida → revisar tesis individuales")
+
+    return "\n".join(out)
+
+# ═════════════════════════════════════════════════════
+#  WEBHOOK LISTENER (estilo n8n)
+#  Recibe alertas externas: n8n, Zapier, TradingView, etc
+# ═════════════════════════════════════════════════════
+def process_webhook_payload(payload, source="external"):
+    """
+    Procesa una alerta externa y la envía formateada a Miki.
+    Payload esperado: {"type": "...", "ticker": "...", "message": "...", "data": {}}
+    """
+    if not (payload and MIKI_CHAT_ID): return False
+    try:
+        ev_type = payload.get("type", "alert")
+        ticker = payload.get("ticker", "")
+        message = payload.get("message", "")
+        data = payload.get("data", {})
+
+        msg = f"🔔 ALERTA EXTERNA ({source})\n"
+        if ticker: msg += f"Ticker: {ticker}\n"
+        msg += f"Tipo: {ev_type}\n"
+        if message: msg += f"\n{message}\n"
+        if data:
+            msg += "\nDatos:\n"
+            for k, v in list(data.items())[:8]:
+                msg += f"  - {k}: {v}\n"
+
+        # Si tiene ticker, añadir tarjeta visual de Jarvis
+        if ticker and len(ticker) <= 6:
+            try:
+                datos = format_data_for_claude(get_real_data(ticker.upper()))
+                if datos and "DATOS NO DISPONIBLES" not in datos:
+                    prompt = (f"Alerta externa sobre {ticker}: {message}\n\n"
+                              f"Genera tarjeta visual EXACTA con interpretación.")
+                    reply = ask_claude(MIKI_CHAT_ID, prompt, get_system_card(),
+                                       web_data=datos, max_tokens=500)
+                    msg += f"\n\n{reply}"
+            except: pass
+
+        send(MIKI_CHAT_ID, msg)
+        # Guardar en memoria L2
+        save_semantic(MIKI_CHAT_ID, f"Alerta externa {source}: {ticker} - {message}",
+                      importance=7, tags=f"webhook,{source},{ev_type}")
+        return True
+    except Exception as e:
+        logging.error(f"Webhook process: {e}")
+        return False
 
 # ═════════════════════════════════════════════════════
 #  SKILLS MODULARES — SOUL/AGENTS/SKILLS/USER en archivos
@@ -1139,18 +1979,40 @@ def execute_tool(tool_name, tool_input, chat_id="webapp"):
     except Exception as e:
         return f"Error ejecutando {tool_name}: {e}"
 
-def claude_with_tools(chat_id, user_msg, system_prompt, max_iters=4):
-    """Claude con tool_use loop nativo. Decide solo qué tools llamar."""
+def claude_with_tools(chat_id, user_msg, system_prompt, max_iters=5):
+    """
+    Claude con tool_use loop nativo + patrón ReAct.
+    REACT: Reason → Act → Observe → Repeat
+    Claude piensa antes de cada tool call, lo cual mejora calidad.
+    """
     if not ANTHROPIC_KEY: return "Sin ANTHROPIC_API_KEY."
+
+    # System prompt enriquecido con instrucciones ReAct
+    react_prompt = system_prompt + """
+
+═══ MODO REACT (Reasoning + Acting) ═══
+Antes de llamar a una tool:
+1. PIENSA brevemente (1-2 frases) qué necesitas y por qué
+2. Llama la tool más relevante
+3. Cuando recibas el resultado, EVALÚA si necesitas más datos
+4. Si tienes lo suficiente, RESPONDE al usuario
+5. Si no, planifica la siguiente tool
+
+CRITERIO: prioriza calidad sobre cantidad. 2-3 tools bien elegidas > 5 tools al azar.
+Si el usuario pregunta por una empresa, SIEMPRE llama get_real_data_fmp primero.
+"""
+
     messages = [{"role": "user", "content": user_msg}]
     iters = 0
+    tools_called = []
+
     while iters < max_iters:
         try:
             r = requests.post("https://api.anthropic.com/v1/messages",
                 headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01",
                          "content-type": "application/json"},
-                json={"model": "claude-sonnet-4-20250514", "max_tokens": 1500,
-                      "system": system_prompt, "messages": messages,
+                json={"model": "claude-sonnet-4-20250514", "max_tokens": 1800,
+                      "system": react_prompt, "messages": messages,
                       "tools": JARVIS_TOOLS}, timeout=60)
             data = r.json()
             if "error" in data:
@@ -1169,23 +2031,27 @@ def claude_with_tools(chat_id, user_msg, system_prompt, max_iters=4):
                         tinput = block.get("input", {})
                         tid = block.get("id")
                         result = execute_tool(tname, tinput, chat_id)
+                        tools_called.append(tname)
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": tid,
                             "content": str(result)[:6000],
                         })
-                        logging.info(f"[TOOL_USE] {tname}({tinput}) → {len(str(result))} chars")
+                        logging.info(f"[REACT iter {iters+1}] {tname}({tinput}) → {len(str(result))} chars")
                 messages.append({"role": "user", "content": tool_results})
                 iters += 1
                 continue
 
             # Respuesta final
             text_blocks = [b.get("text", "") for b in content if b.get("type") == "text"]
-            return "\n".join(text_blocks).strip() or "Sin respuesta."
+            final_text = "\n".join(text_blocks).strip() or "Sin respuesta."
+            if tools_called:
+                logging.info(f"[REACT FINAL] {len(tools_called)} tools usadas: {tools_called}")
+            return final_text
         except Exception as e:
-            logging.error(f"claude_with_tools: {e}")
+            logging.error(f"claude_with_tools ReAct: {e}")
             return f"Error: {e}"
-    return "Demasiadas iteraciones de tools."
+    return "Demasiadas iteraciones de tools (ReAct)."
 
 
 
@@ -1220,7 +2086,7 @@ def ask_claude(chat_id, text, system_prompt, web_data="", max_tokens=600):
 
     # 🧠 L2 — Memoria semántica infinita (busca recuerdos relevantes por significado)
     semantic_recalls = search_semantic(chat_id, text, top_k=5)
-    semantic_txt = format_semantic_recalls(semantic_recalls)
+    semantic_txt = compress_context(semantic_recalls, max_tokens_approx=800)
 
     extras = ""
     if facts_txt: extras += f"\n\nMEMORIA_LARGA (hechos persistentes):\n{facts_txt}"
@@ -1305,6 +2171,7 @@ def claude_call(system_prompt, user_text, max_tokens=600):
 def dexter_research(chat_id, ticker, user_question):
     """
     Filosofía Dexter:
+    0) STRUCTURED THINKING: pre-plan interno silencioso (estilo Superpowers)
     1) PLANNING: Claude diseña un plan de research específico
     2) EXECUTION: ejecuta TODAS las fuentes disponibles para ese ticker
     3) REFLECTION: revisa los datos y detecta huecos
@@ -1312,10 +2179,17 @@ def dexter_research(chat_id, ticker, user_question):
     """
     log_step = lambda s: logging.info(f"[DEXTER {ticker}] {s}")
 
+    # ─── PASO 0: STRUCTURED THINKING (silencioso, no se muestra) ───
+    log_step("Structured thinking interno...")
+    inner_plan = structured_thinking_plan(ticker, user_question)
+    if inner_plan:
+        log_step(f"Plan interno: {inner_plan[:120]}")
+
     # ─── PASO 1: PLANNING ───
     plan_prompt = (
         f"Eres un planner de research financiero. El usuario pregunta:\n\"{user_question}\"\n"
         f"Sobre el ticker: {ticker}\n\n"
+        f"Plan interno de pre-análisis:\n{inner_plan or 'N/A'}\n\n"
         f"Tienes estas fuentes disponibles:\n"
         f"- FMP /stable/ (precio, PER, ROE, ROIC, market cap, FCF)\n"
         f"- SEC EDGAR (10-K, 10-Q, 8-K, Forms 4 insiders)\n"
@@ -1840,9 +2714,16 @@ def gmail_monitor_loop():
             if movs and "error" not in movs[0]:
                 nuevos = persist_movements(movs)
                 if nuevos:
+                    # 🆕 AUTO-ACTUALIZAR CARTERA REAL
+                    actualizados = []
+                    for m in nuevos:
+                        if cartera_apply_movement(m):
+                            actualizados.append(m)
                     msg = "Oye Miki, mira lo que ha llegado a tu Gmail:\n\n"
                     msg += format_movements(nuevos)
-                    msg += "\n\n¿Quieres que actualice tu cartera con esto?"
+                    if actualizados:
+                        msg += f"\n\n✅ {len(actualizados)} movimientos aplicados a tu cartera real."
+                        msg += "\nDi \"mi cartera\" para ver el estado actualizado."
                     send(MIKI_CHAT_ID, msg)
         except Exception as e:
             logging.error(f"Gmail loop: {e}")
@@ -1859,7 +2740,14 @@ def autonomous_briefing_loop():
         try:
             send(MIKI_CHAT_ID, f"🤖 Briefing autónomo · {datetime.now().strftime('%d/%m/%Y %H:%M')}")
             # 1 tarjeta visual por cada posición principal (estilo del documento de Miki)
-            posiciones_clave = ["GOOGL", "MSFT", "VISA", "AAPL", "JNJ"]
+            # Cartera REAL desde Supabase (no hardcoded)
+            cartera = cartera_get_all()
+            if cartera:
+                # Top 5 por valor_actual (las que más pesan)
+                top = sorted(cartera, key=lambda x: -(x.get("valor_actual") or 0))[:5]
+                posiciones_clave = [p["ticker"] for p in top]
+            else:
+                posiciones_clave = ["GOOGL", "MSFT", "VISA", "AAPL", "JNJ"]
             for ticker in posiciones_clave:
                 datos = format_data_for_claude(get_real_data(ticker))
                 if "DATOS NO DISPONIBLES" in datos:
@@ -1928,21 +2816,61 @@ def handle(chat_id, text):
         typing(chat_id)
         send(chat_id, "Voy a echar un ojo a tu Gmail (MyInvestor + Trade Republic + ING)...")
         movs = fetch_broker_movements(days=15)
-        persist_movements(movs)
+        nuevos = persist_movements(movs)
+        # 🆕 Aplicar también a cartera real
+        for m in (nuevos or []):
+            cartera_apply_movement(m)
         send(chat_id, format_movements(movs))
         return
 
-    # Cartera completa
+    # Health Check Cartera
+    health_triggers = ["salud cartera", "salud de la cartera", "health check",
+                       "diagnóstico cartera", "diagnostico cartera", "como va mi cartera",
+                       "diversificación", "diversificacion", "concentración"]
+    if any(t in txt_low for t in health_triggers):
+        typing(chat_id)
+        send(chat_id, "🏥 Diagnosticando tu cartera...")
+        report = portfolio_health_check()
+        send(chat_id, report)
+        # Comentario colega
+        prompt = (f"Aquí el health check de la cartera de Miki:\n\n{report}\n\n"
+                  f"Coméntalo en tono colega 5-7 frases. Qué priorizar, qué cambiar, "
+                  f"qué está bien. Termina con UNA acción concreta.")
+        reply = ask_claude(chat_id, prompt, get_system_chat(), max_tokens=500)
+        send(chat_id, reply)
+        return
+
+    # Cartera completa REAL desde Supabase
     cartera_triggers = ["mi cartera", "toda la cartera", "todas las posiciones",
-                        "cómo está mi cartera", "como está mi cartera", "mis posiciones"]
+                        "cómo está mi cartera", "como está mi cartera", "mis posiciones",
+                        "mi portfolio", "estado cartera", "estado de mi cartera"]
     if any(t in txt_low for t in cartera_triggers):
         typing(chat_id)
-        send(chat_id, "Voy a sacar precios reales de toda la cartera...")
-        datos = get_real_data_multi(["GOOGL", "MSFT", "AAPL", "JNJ", "VISA", "SSNC", "TXRH", "CELH"])
-        prompt = (f"Hoy {hoy}. Cuéntame cómo está mi cartera con esos datos reales. "
-                  f"Tono colega natural, 6-8 frases. Mira si MSFT (-12.5%) se ha movido.")
-        reply = ask_claude(chat_id, prompt, get_system_chat(), web_data=datos, max_tokens=600)
-        send(chat_id, reply)
+        send(chat_id, "📊 Sacando tu cartera real de Supabase + precios actuales...")
+
+        # 1) Cartera completa formateada
+        cartera_str = format_cartera_completa()
+        send(chat_id, cartera_str)
+
+        # 2) Comentario colega de Jarvis con datos reales FMP de las 5 grandes
+        try:
+            top_tickers = ["GOOGL", "MSFT", "AAPL", "JNJ", "VISA"]
+            datos = get_real_data_multi(top_tickers)
+            cartera_data = cartera_get_all()
+            cartera_brief = "\n".join([
+                f"- {p.get('nombre','?')}: €{p.get('valor_actual',0):,.0f} "
+                f"({p.get('resultado_eur',0):+,.0f}€)"
+                for p in cartera_data[:8]
+            ])
+            prompt = (f"Hoy {hoy}. Mira la cartera real de Miki:\n{cartera_brief}\n\n"
+                      f"Y los precios actuales de sus principales:\n{datos}\n\n"
+                      f"Coméntale en tono colega 5-7 frases: qué está funcionando, qué vigilar, "
+                      f"qué hacer hoy. Sin teletipos, frases naturales.")
+            reply = ask_claude(chat_id, prompt, get_system_chat(),
+                              web_data="", max_tokens=600)
+            send(chat_id, reply)
+        except Exception as e:
+            logging.error(f"Comentario cartera: {e}")
         return
 
     # Macro (sin ticker concreto) - AHORA con FRED + ECB en directo
@@ -2064,6 +2992,48 @@ def handle(chat_id, text):
             send(chat_id, f"{dcf_text}\n\n{reply}")
             return
 
+        # ─── VALUE INVESTING SUITE (Magic Formula + Piotroski + Altman + Graham) ───
+        VALUE_TRIGGERS = ["magic formula", "greenblatt", "piotroski", "f-score",
+                          "altman", "z-score", "graham number", "graham", "value score",
+                          "calidad financiera", "riesgo bancarrota", "value suite",
+                          "scoring value", "value investing"]
+        if any(p in txt_low for p in VALUE_TRIGGERS):
+            typing(chat_id)
+            send(chat_id, f"📊 Aplicando suite value investing a {ticker}...\n"
+                          f"Magic Formula + Piotroski F-Score + Altman Z + Graham Number.")
+            value_text = value_investing_full_analysis(ticker)
+            datos = format_data_for_claude(get_real_data(ticker))
+            prompt = (f"Aquí los scores value investing de {ticker}:\n\n{value_text}\n\n"
+                      f"Datos contexto:\n{datos}\n\n"
+                      f"Interpreta los resultados en tono colega: ¿es value real o value trap? "
+                      f"¿qué dicen los scores juntos? Termina con SEÑAL. 5-7 líneas.")
+            reply = ask_claude(chat_id, prompt, get_system_chat(), max_tokens=600)
+            send(chat_id, f"{value_text}\n\n{reply}")
+            return
+
+        # ─── RED FLAGS DETECTOR ───
+        RED_FLAGS_TRIGGERS = ["red flags", "redflags", "banderas rojas", "flags",
+                              "problemas", "qué riesgos", "que riesgos", "alertas",
+                              "auditoría", "auditoria", "warning"]
+        if any(p in txt_low for p in RED_FLAGS_TRIGGERS):
+            typing(chat_id)
+            send(chat_id, f"🚩 Detectando red flags en {ticker}...")
+            data = get_real_data(ticker)
+            sec = sec_get_filings(ticker, n=5)
+            flags = detect_red_flags(ticker, data, sec)
+            instincts = detect_instincts(ticker, data)
+            output = format_red_flags(flags)
+            if instincts:
+                output += "\n\n" + format_instincts(instincts)
+            send(chat_id, output)
+            # Comentario colega
+            datos = format_data_for_claude(data)
+            prompt = (f"Red flags detectados en {ticker}:\n{output}\n\nDatos:\n{datos}\n\n"
+                      f"Coméntalo en tono colega 4-5 frases. ¿Es preocupante o normal? Señal final.")
+            reply = ask_claude(chat_id, prompt, get_system_chat(), max_tokens=400)
+            send(chat_id, reply)
+            return
+
         # ─── DEXTER RESEARCH (super cerebro de Jarvis) ───
         # Se activa con CUALQUIER intención de análisis profundo o valoración
         DEXTER_TRIGGERS = [
@@ -2119,13 +3089,20 @@ def handle(chat_id, text):
             send(chat_id, reply)
             return
 
-        # POR DEFECTO con ticker → TARJETA VISUAL
+        # POR DEFECTO con ticker → TARJETA VISUAL + Instincts auto
         typing(chat_id)
-        datos = format_data_for_claude(get_real_data(ticker))
+        data_raw = get_real_data(ticker)
+        datos = format_data_for_claude(data_raw)
+        # Instincts automáticos (silencioso pero relevante)
+        instincts = detect_instincts(ticker, data_raw)
+        instincts_block = format_instincts(instincts) if instincts else ""
+
         prompt = (f"Datos reales de {ticker} hoy {hoy}.\n"
                   f"Pregunta del usuario: \"{txt}\"\n"
-                  f"Responde con la tarjeta visual EXACTA según las reglas del sistema.")
-        reply = ask_claude(chat_id, prompt, get_system_card(), web_data=datos, max_tokens=600)
+                  f"{instincts_block}\n\n"
+                  f"Responde con la tarjeta visual EXACTA según las reglas del sistema. "
+                  f"Si hay instintos relevantes, intégralos en la 'Lectura Jarvis'.")
+        reply = ask_claude(chat_id, prompt, get_system_card(), web_data=datos, max_tokens=650)
         send(chat_id, reply)
         return
 
@@ -2288,7 +3265,7 @@ def handle_image(chat_id, file_id, caption=""):
 # ═════════════════════════════════════════════════════
 def poll():
     offset = 0
-    logging.info(f"JARVIS v16 OPEN BRAIN - {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    logging.info(f"JARVIS v20 INSTINCTS - {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     logging.info(f"FMP:{'OK' if FMP_KEY else 'NO'} | "
                  f"Anthropic:{'OK' if ANTHROPIC_KEY else 'NO'} | "
                  f"Whisper:{'OK' if OPENAI_KEY else 'NO'} | "
@@ -2536,11 +3513,11 @@ class H(BaseHTTPRequestHandler):
             if not self._guard(path, protected=False): return
 
             if path in ("/", "/health"):
-                self._text(f"JARVIS v16 OPEN BRAIN - {datetime.now().strftime('%d/%m/%Y %H:%M')} - Online", 200)
+                self._text(f"JARVIS v20 INSTINCTS - {datetime.now().strftime('%d/%m/%Y %H:%M')} - Online", 200)
                 return
 
             if path == "/app":
-                html = JARVIS_APP_HTML.replace("__APP_VERSION__", "JARVIS v16 OPEN BRAIN")
+                html = JARVIS_APP_HTML.replace("__APP_VERSION__", "JARVIS v20 INSTINCTS")
                 self._html(html, 200); return
 
             if path == "/favicon.ico":
@@ -2610,6 +3587,16 @@ class H(BaseHTTPRequestHandler):
                     self._err("missing ticker", 400); return
                 self._json(get_real_data(ticker), 200); return
 
+            if path == "/webhook":
+                # Webhook genérico: recibe alertas externas (n8n, Zapier, TradingView, etc.)
+                source = str(body.get("source") or "external")[:40]
+                ok = process_webhook_payload(body, source=source)
+                if ok:
+                    self._json({"ok": True, "delivered": True}, 200)
+                else:
+                    self._json({"ok": False, "error": "delivery failed"}, 500)
+                return
+
             self._err("not found", 404)
         except Exception as e:
             logging.error(f"POST {self.path}: {e}")
@@ -2651,8 +3638,11 @@ def main():
     threading.Thread(target=gmail_monitor_loop, daemon=True).start()
     threading.Thread(target=autonomous_briefing_loop, daemon=True).start()
     threading.Thread(target=alerts_loop, daemon=True).start()
+    threading.Thread(target=self_improve_loop, daemon=True).start()
     logging.info(f"🌐 WebApp activa en /app | API en /chat /quote /portfolio /health")
     logging.info(f"🔐 AUTH_REQUIRED={AUTH_REQUIRED} | RATE_LIMIT={RATE_MAX_REQ}/{RATE_WIN_SEC}s")
     HTTPServer(("0.0.0.0", PORT), H).serve_forever()
 
 if __name__ == "__main__":
+    main()
+
