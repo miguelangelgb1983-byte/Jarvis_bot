@@ -1,21 +1,21 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║   JARVIS v10 — DEFINITIVO · Miguel (Miki) · 01/05/2026              ║
+║   JARVIS v22 — DEFINITIVO · Miguel (Miki) · 10/05/2026              ║
 ║                                                                      ║
-║   ✅ FMP precios reales (NO yfinance)                                ║
-║   ✅ Tavily + fallback FED/SEC/Yahoo RSS                             ║
-║   ✅ Tarjeta visual SIEMPRE para empresas                            ║
-║   ✅ Conversación natural sin comandos                               ║
-║   ✅ Plantilla EXACTA de Miki                                        ║
-║   ✅ Validación al arranque (errores claros)                         ║
-║   ✅ Zonas horarias correctas (España + NY)                          ║
-║   ✅ Memoria SQLite + Supabase                                       ║
-║   ✅ Audios Whisper + Voz ElevenLabs                                 ║
-║   ✅ Gmail: MyInvestor + Trade Republic + ING                        ║
-║   ✅ Briefing autónomo cada 6h                                       ║
-║   ✅ Modo degradado si falta ANTHROPIC_KEY                           ║
-║   ✅ "recuerda que..." → memoria permanente                          ║
-║   ✅ do_HEAD UptimeRobot 24/7                                        ║
+║   🆕 v22 FIXES CRÍTICOS:                                             ║
+║   ✅ FIX 1: Triggers EXCLUSIVOS (detect_intent_strict)              ║
+║   ✅ FIX 2: UNA pregunta = UNA empresa (sin solapamientos)          ║
+║   ✅ FIX 3: Memoria L0 reforzada (8 mensajes + contexto reciente)   ║
+║   ✅ FIX 4: 🧠 DEXTER ACTIVO visible (marker arriba/abajo)          ║
+║   ✅ FIX 5: Plantilla AUTÉNTICA Miki cargada (4 hojas Excel)        ║
+║   ✅ FIX 6: NO INVENTAR estricto (NO VERIFICADO si falta dato)      ║
+║   ✅ FIX 7: Tono humano español de España                           ║
+║                                                                      ║
+║   ✅ TODO LO DEL v20 PRESERVADO (FMP, SEC, Insiders, FRED, ECB,    ║
+║      iShares, Tavily, Wikipedia, Whisper, ElevenLabs, Vision,      ║
+║      Gmail, Cartera Real, Memoria L2 Embeddings, Auto-learning,    ║
+║      Auto-improve, Skills modulares, Equipo Jarvis, DCF, Value     ║
+║      Suite, Red Flags, Instincts, Webhook, Web /app, etc.)         ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 import os, logging, requests, threading, json, time
@@ -120,6 +120,103 @@ def detect_ticker(text):
             if kw in txt_low:
                 return ticker
     return None
+
+# ═════════════════════════════════════════════════════
+#  FIX v22 — detect_intent_strict: UNA pregunta = UNA acción
+#  Clasifica la intención EXACTA con prioridad clara, sin solapamiento
+# ═════════════════════════════════════════════════════
+def detect_intent_strict(text):
+    """
+    Devuelve la intención dominante (una sola, en orden de prioridad):
+      'valoracion'       → valórame X / valoración / plantilla / valor intrínseco
+      'tesis'            → tesis de inversión, qué piensas a fondo
+      'earnings'         → resultados, beat, guidance
+      'red_flags'        → red flags, banderas rojas, riesgos
+      'dcf'              → DCF, flujo descontado
+      'value_score'      → magic formula, piotroski, altman, graham
+      'equipo'           → equipo, council, debate, bull bear
+      'autopilot'        → autopilot, decide tú
+      'insiders'         → insiders, directivos
+      'news'             → noticias, qué pasa, qué hay nuevo
+      'macro'            → macro, FED, BCE, inflación
+      'price'            → precio, cotización, cuánto vale
+      'conversacion'     → cualquier otra cosa
+    """
+    t = " " + text.lower().strip() + " "
+
+    # PRIORIDAD 1: Valoración (la palabra clave EXACTA gana)
+    valoracion_signals = [
+        "valórame", "valorame", "valórala", "valorala", "valórate",
+        "valoración", "valoracion", " valora ", " valora.", " valora?", " valora,",
+        "valor intrínseco", "valor intrinseco", "precio justo",
+        "precio objetivo", "precio target", "fair value",
+        "plantilla", "invertir desde", "merece la pena", "vale la pena",
+        "compro o no", "vendo o no", "qué hago con", "que hago con",
+    ]
+    if any(s in t for s in valoracion_signals):
+        return "valoracion"
+
+    # PRIORIDAD 2: Tesis específica
+    tesis_signals = ["tesis de inversión", "tesis de inversion", "haz una tesis",
+                     "hazme una tesis", "hazme la tesis", "dame la tesis",
+                     "thesis ", " tesis ", " tesis."]
+    if any(s in t for s in tesis_signals):
+        return "tesis"
+
+    # PRIORIDAD 3: Earnings (sólo si menciona earnings/resultados claramente)
+    earnings_signals = [" earnings", "resultados trimestre", "han presentado", "ha presentado",
+                        "presenta resultados", "reportado", "beat ", " miss ",
+                        "guidance", "guía", " q1 ", " q2 ", " q3 ", " q4 "]
+    if any(s in t for s in earnings_signals):
+        return "earnings"
+
+    # PRIORIDAD 4: Red flags
+    if any(s in t for s in ["red flags", "redflags", "banderas rojas", "qué riesgos",
+                             "que riesgos", "alertas", "warning"]):
+        return "red_flags"
+
+    # PRIORIDAD 5: DCF explícito
+    if any(s in t for s in [" dcf ", "discounted cash flow", "flujo de caja descontado",
+                             "valoración por flujos"]):
+        return "dcf"
+
+    # PRIORIDAD 6: Value scoring
+    if any(s in t for s in ["magic formula", "greenblatt", "piotroski", "f-score",
+                             "altman", "z-score", "graham number"]):
+        return "value_score"
+
+    # PRIORIDAD 7: Equipo / debate
+    if any(s in t for s in ["equipo", "subagentes", "council", "consejo de inversión",
+                             "consejo de inversion", "bull bear", "bull vs bear",
+                             "buffett y munger", "klarman", "debate", "institucional"]):
+        return "equipo"
+
+    # PRIORIDAD 8: Autopilot
+    if any(s in t for s in ["autopilot", "decide tú", "decide tu", "tú decides",
+                             "haz lo que veas", "investiga tú", "investiga tu"]):
+        return "autopilot"
+
+    # PRIORIDAD 9: Insiders
+    if any(s in t for s in [" insider", " insiders", "directivos", "compras del ceo",
+                             "compras del cfo"]):
+        return "insiders"
+
+    # PRIORIDAD 10: News
+    if any(s in t for s in [" noticias", "qué pasa", "que pasa", "qué hay nuevo",
+                             "que hay nuevo", "últimas novedades"]):
+        return "news"
+
+    # PRIORIDAD 11: Macro (sin ticker)
+    if any(s in t for s in [" macro", " fed ", "inflación", "inflacion", " vix",
+                             " bce ", " ecb ", "tipos de interés", "tipos de interes"]):
+        return "macro"
+
+    # PRIORIDAD 12: Precio simple
+    if any(s in t for s in ["precio de", "cuánto vale", "cuanto vale", "cotización",
+                             "cotizacion", "a cómo está", "a como está", "a como esta"]):
+        return "price"
+
+    return "conversacion"
 
 CONVERSATIONAL_KEYWORDS = [
     "qué piensas", "que piensas", "qué opinas", "que opinas",
@@ -629,61 +726,96 @@ def get_system_chat():
     hoy = datetime.now().strftime("%d/%m/%Y")
     hora = datetime.now().strftime("%H:%M")
     mercado = market_status_human()
-    return f"""Eres JARVIS, el colega de Miki para inversión.
-Modo CONVERSACIÓN: NO uses tarjeta visual, habla normal.
+    return f"""Eres JARVIS, el colega-analista de Miki. NO un asistente. Su socio analítico de inversión.
 
 Hoy: {hoy} {hora} (España). Mercado: {mercado}
 
-═══ TU SUPER CEREBRO ═══
-Tienes integrado DEXTER, tu motor de research profundo. Funciona en 4 pasos:
-1) PLANNING: planificas qué fuentes usar
-2) EXECUTION: cruzas FMP + SEC EDGAR + OpenInsider + FRED + ECB + Tavily
-3) REFLECTION: detectas huecos y contradicciones
-4) ANSWER: rellenas la PLANTILLA EXACTA DE MIKI con datos verificados
+═══ REGLA #1 ABSOLUTA — NO INVENTAR JAMÁS ═══
+Si NO tienes el dato verificado de FMP/SEC/OpenInsider/FRED/ECB/Tavily → escribes literalmente:
+  "NO VERIFICADO" para datos puntuales
+  "NO CALCULABLE con los datos disponibles" para cálculos
+  "INVESTIGAR MÁS" como señal final si faltan datos críticos
+NO te inventes precios, PER, FCF, valor intrínseco, márgenes ni rentabilidades.
+Mejor decir "no lo sé" que dar un dato falso. Esto es DEFINITIVO.
 
-CUANDO Miki pide CUALQUIER valoración → ya se activa Dexter automáticamente.
-TU OBLIGACIÓN cuando llegue resultado de Dexter: SIEMPRE usar la plantilla EXACTA, las 9 secciones,
-sin saltarte ninguna, sin inventar datos, sin pegote literario.
+═══ REGLA #2 — UNA pregunta = UNA respuesta ═══
+Si Miki te pregunta por UNA empresa, hablas SOLO de esa empresa.
+Si te pregunta "valor intrínseco", das EL VALOR INTRÍNSECO (no una tesis).
+Si te pregunta "tesis", das LA TESIS (no una valoración).
+NO te vayas por las ramas. NO mezcles temas.
+
+═══ REGLA #3 — Memoria activa ═══
+Recibirás un bloque "ÚLTIMOS TURNOS DE NUESTRA CONVERSACIÓN" con tus turnos previos.
+ÚSALOS. NO repitas lo que ya dijiste antes. Si Miki te dijo X hace 2 turnos, lo recuerdas.
+
+═══ TU SUPER CEREBRO — DEXTER ═══
+Cuando Miki pide cualquier VALORACIÓN o análisis profundo → DEXTER se activa automáticamente:
+1) PLANNING: planifica qué fuentes consultar
+2) EXECUTION: cruza FMP + SEC EDGAR + OpenInsider + FRED + ECB + Tavily + Wikipedia
+3) REFLECTION: detecta huecos, contradicciones, red flags
+4) ANSWER: rellena la PLANTILLA EXACTA DE MIKI con DATOS REALES
+
+Cuando recibas datos de Dexter, EMPIEZAS la respuesta con:
+"🧠 DEXTER ACTIVO · Fuentes: FMP + SEC + OpenInsider + Tavily"
+Y ACABAS con:
+"🧠 DEXTER COMPLETADO · Convicción: X/10"
 
 ═══ CÓMO HABLAS (modo conversación) ═══
-- COLOQUIAL ESPAÑOL DE ESPAÑA. Como en un bar.
-- Frases cortas, naturales.
-- Usa: "joder", "vaya", "pinta bien", "está jodido", "ojo con esto"
-- NUNCA estilo teletipo
-- NUNCA listas con bullets
+- ESPAÑOL DE ESPAÑA, coloquial. Como un colega inversor en un bar.
+- Frases cortas, directas, naturales. NO estilo teletipo.
+- Usa: "joder", "vaya", "pinta bien", "está jodido", "ojo con esto", "tela", "mira"
+- NO bullets en conversación. NO listas robóticas.
+- Si Miki está agobiado, le escuchas PRIMERO. Luego ayudas.
+- Si te equivocaste antes, lo reconoces. Sin dramatizar.
+- Si NO sabes algo, lo dices. "No tengo ese dato verificado, no me lo invento."
 
-Si Miki está agobiado, primero le escuchas. Luego ayudas.
-
-═══ FUENTES DE DATOS (REALES, NO INVENTAR) ═══
-- FMP /stable/: precio, PER, ROE, ROIC, FCF, market cap (si FMP free no cubre, hay fallback)
-- SEC EDGAR: 10-K, 10-Q, 8-K, Forms 4 (insiders) - sin límite, oficial
-- OpenInsider: compras/ventas directivos
+═══ FUENTES DE DATOS (REALES, VERIFICADAS) ═══
+- FMP /stable/: precio, PER, ROE, ROIC, FCF, market cap (fallback Tavily si no cubre)
+- SEC EDGAR: 10-K, 10-Q, 8-K, Forms 4 (insiders) — oficial sin límite
+- OpenInsider: compras/ventas directivos detalladas
 - FRED: macro USA (FED, CPI, paro, bono 10y, VIX, dólar)
 - ECB: macro Europa (tipos depósito BCE, refinanciación)
 - iShares: holdings oficiales SP500 e India
 - Tavily: noticias actuales + fallback small caps
+- Wikipedia: contexto histórico empresas
 
-═══ PLANTILLA DE VALORACIÓN ═══
-Tienes cargada la PLANTILLA EXACTA de "Invertir Desde 0" (9 secciones obligatorias):
-1) Tesis (3 líneas)
-2) Datos base (precio, market cap, sector)
-3) Calidad (ROE, margen, deuda, FCF)
-4) Crecimiento y ejecución
-5) Valoración con FÓRMULAS (rango 52s, FCF Yield, De-rating PER)
-6) Precio justo (3 escenarios + margen seguridad)
-7) Riesgos (máx 3)
-8) Decisión operativa (acción, zona, tamaño, invalidación)
-9) Convicción 0-10 + frase final
+═══ PLANTILLA DE VALORACIÓN AUTÉNTICA DE MIKI ═══
+Cuando se active Dexter o Miki pida valoración, usas SU PLANTILLA EXACTA "Invertir Desde 0":
+- HOJA 1: Income Statement (10y + 5e) — Sales, EBITDA, EBIT, EBT, NI, EPS, Tax Rate, Diluted Shares
+- HOJA 2: FCF — EBITDA → CapEx Mant → Interest → Taxes → ΔWC → FCF + FCFPS + Asignación capital
+- HOJA 3: Valoración — Market Cap, Net Debt, EV, PER/EV/FCF/EV/EBITDA/EV/EBIT (LTM/NTM/Objetivo),
+                       Precio objetivo 5 años, Margen seguridad
+- HOJA 4: ROIC = EBIT*(1-T) / (Equity + Deuda + Op.Leases - Marketable Sec)
 
-═══ CARTERA ACTUAL ═══
-€34.145 +22%. GOOGL +77% (la grande). MSFT -12.5% (vigilar).
-VISA nueva. NKE vendida.
+Fórmulas (recordatorio):
+- EBITDA = NI + Interests(net) + Taxes + D&A
+- EV = Market Cap + Net Debt
+- WC = Inventarios + AR - AP
+- CWC + → DISMINUYE FCF | CWC - → AUMENTA FCF
+- FCF = EBITDA - Interests(net) - Taxes - CapEx Mant - CWC
+- ROIC = EBIT*(1-T) / Invested Capital
+
+═══ SEÑAL FINAL (siempre una de estas, NUNCA ambigua) ═══
+🟢 COMPRAR    → margen seguridad >30%, calidad alta, datos verificados
+🟡 ACUMULAR   → margen 15-30%, calidad alta
+🟡 MANTENER   → margen <15% o no claramente barata
+⚪ VIGILAR    → interesante pero precio no acompaña
+🔴 REDUCIR    → sobrevalorada, riesgo aumenta
+🔴 VENDER     → tesis rota / deterioro grave
+❓ INVESTIGAR MÁS → faltan datos críticos (DEFAULT si dudas)
+
+═══ CARTERA REAL DE MIKI (verificada Supabase) ═══
+Total: ~€36.766 (+29.88%) · 16 posiciones
+Mayor: GOOGL +€3.886 (alta convicción)
+Vigilancia: MSFT, MONC, INDIA, TXRH (en pérdida)
+Top performers: ZEG +77%, JNJ +55%, GOLD +37%, SP500/Europe/SmCap todos +25%+
+NKE: vendida correctamente Abril 2026 · VISA: comprada nueva
 
 ═══ LONGITUD POR DEFECTO ═══
 - Saludo: 1-2 frases
 - Pregunta puntual: 2-4 frases
 - Conversación: 3-6 frases máximo
-- Resultado Dexter / valoración: las 9 secciones de la plantilla SIN RECORTAR
+- Resultado Dexter / valoración completa: plantilla SIN RECORTAR
 """ + (("\n\n═══ SKILLS MODULARES (archivos editables) ═══\n" + load_all_skills()) if load_all_skills() else "") + (("\n\n═══ AUTO-MEJORAS DIARIAS ═══\n" + get_self_prompt()) if get_self_prompt() else "")
 
 # ═════════════════════════════════════════════════════
@@ -2076,7 +2208,8 @@ def ask_claude(chat_id, text, system_prompt, web_data="", max_tokens=600):
             return f"Datos disponibles (sin Claude para análisis):\n\n{web_data[:2000]}"
         return "Sin ANTHROPIC_API_KEY configurada en Render."
 
-    mem = load_memory(chat_id, limit=4)
+    # FIX v22: cargar más memoria para que recuerde conversaciones recientes
+    mem = load_memory(chat_id, limit=8)  # antes: 4
     facts = list_knowledge(chat_id, limit=6)
     txs = recent_transactions(limit=4)
     if chat_id not in history: history[chat_id] = []
@@ -2088,10 +2221,20 @@ def ask_claude(chat_id, text, system_prompt, web_data="", max_tokens=600):
     semantic_recalls = search_semantic(chat_id, text, top_k=5)
     semantic_txt = compress_context(semantic_recalls, max_tokens_approx=800)
 
+    # FIX v22: bloque explícito de últimos turnos para que NUNCA olvide la conversación reciente
+    contexto_reciente = ""
+    recent_turns = history[chat_id][-6:] if history[chat_id] else []
+    if recent_turns:
+        contexto_reciente = "\n\nÚLTIMOS TURNOS DE NUESTRA CONVERSACIÓN (no los olvides):\n"
+        for m in recent_turns[-4:]:
+            role = "Miki" if m["role"] == "user" else "Jarvis"
+            contexto_reciente += f"  [{role}]: {m['content'][:300]}\n"
+
     extras = ""
     if facts_txt: extras += f"\n\nMEMORIA_LARGA (hechos persistentes):\n{facts_txt}"
     if tx_txt: extras += f"\n\nTX_GMAIL (movimientos brokers):\n{tx_txt}"
     if semantic_txt: extras += f"\n\n{semantic_txt}"
+    if contexto_reciente: extras += contexto_reciente
 
     if web_data:
         content = f"{text}\n\n{web_data}{extras}"
@@ -2099,7 +2242,7 @@ def ask_claude(chat_id, text, system_prompt, web_data="", max_tokens=600):
         content = text + extras
 
     history[chat_id].append({"role": "user", "content": content})
-    all_msgs = mem + history[chat_id][-4:]
+    all_msgs = mem + history[chat_id][-6:]  # antes: -4
 
     msgs = []; last_role = None
     for m in all_msgs:
@@ -2247,11 +2390,22 @@ def dexter_research(chat_id, ticker, user_question):
         f"PLAN DE RESEARCH SEGUIDO:\n{plan or '(plan no generado)'}\n\n"
         f"DATOS RECOPILADOS:\n{full_data}\n\n"
         f"REFLEXIÓN CRÍTICA:\n{reflection or '(sin reflexión)'}\n\n"
-        f"AHORA: rellena ESTA plantilla EXACTA con los datos reales (no inventes):\n\n{template}\n\n"
-        f"Si un dato no existe, escribe 'NO DISPONIBLE' en esa línea pero sigue rellenando el resto. "
-        f"Cierra con la decisión clara y la convicción 0-10."
+        f"═══════════════════════════════════════════════════\n"
+        f"INSTRUCCIONES OBLIGATORIAS DE FORMATO (no negociable):\n"
+        f"═══════════════════════════════════════════════════\n"
+        f"1) EMPIEZA tu respuesta con esta línea EXACTA:\n"
+        f"   🧠 DEXTER ACTIVO · Fuentes: FMP + SEC EDGAR + OpenInsider + Tavily + FRED\n"
+        f"\n"
+        f"2) RELLENA esta plantilla EXACTA de Miki con los datos reales recopilados arriba:\n\n"
+        f"{template}\n\n"
+        f"3) Si un dato NO existe en lo recopilado → escribe literalmente 'NO VERIFICADO'.\n"
+        f"   Si un cálculo NO se puede hacer → escribe 'NO CALCULABLE con los datos disponibles'.\n"
+        f"   PROHIBIDO inventarse números. Mejor decir 'no lo sé' que dar dato falso.\n"
+        f"\n"
+        f"4) ACABA con esta línea EXACTA (rellena la convicción real):\n"
+        f"   🧠 DEXTER COMPLETADO · Convicción: X/10 · Datos verificados en N fuentes\n"
     )
-    return ask_claude(chat_id, final_prompt, get_system_chat(), max_tokens=1300)
+    return ask_claude(chat_id, final_prompt, get_system_chat(), max_tokens=1500)
 
 # ═════════════════════════════════════════════════════
 #  EQUIPO JARVIS — Subagentes (estilo TradingAgents)
@@ -2928,58 +3082,48 @@ def handle(chat_id, text):
                     send(chat_id, f"No he podido sacar los holdings de {etf} ahora mismo.")
                 return
 
-    # ─── EMPRESA DETECTADA ───
+    # ─── EMPRESA DETECTADA — ROUTING POR INTENT_STRICT (FIX v22) ───
     ticker = detect_ticker(txt)
+    intent = detect_intent_strict(txt)
+    logging.info(f"[v22-router] ticker={ticker} intent={intent} txt={txt[:80]}")
 
-    if ticker:
-        # Conversacional explícito → responde como colega
-        if is_conversational(txt):
+    # Si NO hay ticker pero hay intención de macro/news/insiders global
+    if not ticker:
+        if intent == "macro":
             typing(chat_id)
-            datos = format_data_for_claude(get_real_data(ticker))
-            reply = ask_claude(chat_id, txt, get_system_chat(), web_data=datos, max_tokens=400)
+            send(chat_id, "Sacando datos macro oficiales (FED + BCE)...")
+            fred_data = fred_macro_snapshot()
+            ecb_data = ecb_macro_snapshot()
+            news = search_news("FED tipos inflacion VIX dolar mercados hoy", n=2)
+            macro_full = f"{fred_data}\n\n{ecb_data}\n\nNoticias:\n{news}"
+            prompt = f"Cuéntame cómo está la macro hoy {hoy} en lenguaje colega. Usa los datos oficiales."
+            reply = ask_claude(chat_id, prompt, get_system_chat(), web_data=macro_full, max_tokens=500)
             send(chat_id, reply)
-            audio = tts(reply[:500])
-            if audio: send_audio(chat_id, audio)
             return
 
-        # ─── AUTOPILOT (Claude decide solo qué tools usar) ───
-        AUTOPILOT_TRIGGERS = ["autopilot", "auto", "decide tu", "decide tú",
-                              "tú decides", "tu decides", "lo que veas",
-                              "lo que sea necesario", "haz lo que veas",
-                              "investiga tú", "investiga tu"]
-        if any(p in txt_low for p in AUTOPILOT_TRIGGERS):
+    if ticker:
+        # FIX v22: routing EXCLUSIVO por intent (no cascada con solapamientos)
+        
+        # 1) AUTOPILOT (Claude decide tools)
+        if intent == "autopilot":
             typing(chat_id)
             send(chat_id, f"🤖 AUTOPILOT activado para {ticker}.\n"
-                          f"Decido qué fuentes consultar (FMP/SEC/Insiders/News/Macro/Wiki/Memoria).\n"
-                          f"30-60 segundos.")
+                          f"Decido qué fuentes consultar.\n30-60 segundos.")
             reply = claude_with_tools(chat_id, txt, get_system_chat(), max_iters=5)
             send(chat_id, reply)
             return
 
-        # ─── EQUIPO JARVIS (subagentes TradingAgents-style) ───
-        # Modo MÁS profundo aún que Dexter: 4 analistas + Bull/Bear + Riesgo + Plantilla
-        EQUIPO_TRIGGERS = [
-            "equipo", "subagentes", "council", "consejo de inversión",
-            "consejo de inversion", "mesa de análisis", "mesa de analisis",
-            "buffett", "lynch", "klarman", "munger",
-            "bull bear", "bull vs bear", "alcista bajista", "debate",
-            "institucional", "buy-side", "buy side",
-            "análisis máximo", "analisis maximo", "análisis total", "analisis total",
-            "research completo", "research total",
-        ]
-        if any(p in txt_low for p in EQUIPO_TRIGGERS):
+        # 2) EQUIPO JARVIS (subagentes)
+        if intent == "equipo":
             typing(chat_id)
             send(chat_id, f"🏢 Activando EQUIPO JARVIS COMPLETO para {ticker}...\n"
-                          f"4 analistas + Debate Bull/Bear + Gestores riesgo + Fund Manager.\n"
-                          f"60-90 segundos. Salida: tu PLANTILLA EXACTA + decisión del equipo.")
+                          f"4 analistas + Bull/Bear + Riesgo + Fund Manager.\n60-90 segundos.")
             reply = jarvis_team_research(chat_id, ticker, txt)
             send(chat_id, reply)
             return
 
-        # ─── DCF CALCULATOR explícito ───
-        DCF_TRIGGERS = ["dcf", "discounted cash flow", "flujo de caja descontado",
-                        "valoración por flujos", "valoracion por flujos"]
-        if any(p in txt_low for p in DCF_TRIGGERS):
+        # 3) DCF
+        if intent == "dcf":
             typing(chat_id)
             send(chat_id, f"💰 Calculando DCF de {ticker} con 3 escenarios...")
             dcf_text = dcf_full_analysis(ticker)
@@ -2987,35 +3131,26 @@ def handle(chat_id, text):
             prompt = (f"Aquí tienes el DCF calculado de {ticker}:\n\n{dcf_text}\n\n"
                       f"Datos contexto:\n{datos}\n\n"
                       f"Comenta el resultado en tono colega: ¿está cara o barata? "
-                      f"¿qué escenario es realista? Termina con DECISIÓN. 5-7 líneas.")
+                      f"Termina con DECISIÓN. 5-7 líneas.")
             reply = ask_claude(chat_id, prompt, get_system_chat(), max_tokens=600)
             send(chat_id, f"{dcf_text}\n\n{reply}")
             return
 
-        # ─── VALUE INVESTING SUITE (Magic Formula + Piotroski + Altman + Graham) ───
-        VALUE_TRIGGERS = ["magic formula", "greenblatt", "piotroski", "f-score",
-                          "altman", "z-score", "graham number", "graham", "value score",
-                          "calidad financiera", "riesgo bancarrota", "value suite",
-                          "scoring value", "value investing"]
-        if any(p in txt_low for p in VALUE_TRIGGERS):
+        # 4) VALUE SCORE
+        if intent == "value_score":
             typing(chat_id)
-            send(chat_id, f"📊 Aplicando suite value investing a {ticker}...\n"
-                          f"Magic Formula + Piotroski F-Score + Altman Z + Graham Number.")
+            send(chat_id, f"📊 Aplicando suite value investing a {ticker}...")
             value_text = value_investing_full_analysis(ticker)
             datos = format_data_for_claude(get_real_data(ticker))
             prompt = (f"Aquí los scores value investing de {ticker}:\n\n{value_text}\n\n"
                       f"Datos contexto:\n{datos}\n\n"
-                      f"Interpreta los resultados en tono colega: ¿es value real o value trap? "
-                      f"¿qué dicen los scores juntos? Termina con SEÑAL. 5-7 líneas.")
+                      f"Interpreta en tono colega: ¿es value real o value trap? Termina con SEÑAL. 5-7 líneas.")
             reply = ask_claude(chat_id, prompt, get_system_chat(), max_tokens=600)
             send(chat_id, f"{value_text}\n\n{reply}")
             return
 
-        # ─── RED FLAGS DETECTOR ───
-        RED_FLAGS_TRIGGERS = ["red flags", "redflags", "banderas rojas", "flags",
-                              "problemas", "qué riesgos", "que riesgos", "alertas",
-                              "auditoría", "auditoria", "warning"]
-        if any(p in txt_low for p in RED_FLAGS_TRIGGERS):
+        # 5) RED FLAGS
+        if intent == "red_flags":
             typing(chat_id)
             send(chat_id, f"🚩 Detectando red flags en {ticker}...")
             data = get_real_data(ticker)
@@ -3026,77 +3161,102 @@ def handle(chat_id, text):
             if instincts:
                 output += "\n\n" + format_instincts(instincts)
             send(chat_id, output)
-            # Comentario colega
             datos = format_data_for_claude(data)
             prompt = (f"Red flags detectados en {ticker}:\n{output}\n\nDatos:\n{datos}\n\n"
-                      f"Coméntalo en tono colega 4-5 frases. ¿Es preocupante o normal? Señal final.")
+                      f"Coméntalo en tono colega 4-5 frases. ¿Preocupante? Señal final.")
             reply = ask_claude(chat_id, prompt, get_system_chat(), max_tokens=400)
             send(chat_id, reply)
             return
 
-        # ─── DEXTER RESEARCH (super cerebro de Jarvis) ───
-        # Se activa con CUALQUIER intención de análisis profundo o valoración
-        DEXTER_TRIGGERS = [
-            # Valoración explícita
-            "valora", "valoración", "valoracion", "valórame", "valorame",
-            "valuar", "evaluar", "evalúa", "evalua",
-            # Plantilla
-            "plantilla", "invertir desde 0", "invertir desde cero",
-            # Precio justo / valor intrínseco
-            "precio justo", "valor intrínseco", "valor intrinseco",
-            "precio objetivo", "precio target",
-            # Análisis profundo
-            "análisis profundo", "analisis profundo", "análisis completo",
-            "analisis completo", "research", "investiga", "estudia",
-            "tesis", "tesis de inversión", "deep dive",
-            # Decisión
-            "compro o no", "vendo o no", "qué hago con", "que hago con",
-            "merece la pena", "vale la pena",
-        ]
-        if any(p in txt_low for p in DEXTER_TRIGGERS):
+        # 6) INSIDERS
+        if intent == "insiders":
             typing(chat_id)
-            send(chat_id, f"🧠 Activando DEXTER (super cerebro) para {ticker}...\n"
-                          f"Plan → Datos (FMP+SEC+Insiders+News+Macro+Wiki) → Reflexión → Plantilla EXACTA.\n"
-                          f"30-45 segundos.")
-            reply = dexter_research(chat_id, ticker, txt)
+            send(chat_id, f"Mirando insiders de {ticker} en OpenInsider...")
+            ins_data = openinsider_get(ticker, n=10)
+            if not ins_data:
+                send(chat_id, f"No he encontrado datos de insiders recientes para {ticker}.")
+                return
+            prompt = (f"Resume estos movimientos de insiders de {ticker} para Miki. "
+                      f"Tono colega. Si hay compras del CEO/CFO, marca eso. "
+                      f"Si solo hay ventas planeadas (10b5-1) avísalo.")
+            reply = ask_claude(chat_id, prompt, get_system_chat(), web_data=ins_data, max_tokens=500)
             send(chat_id, reply)
             return
 
-        # ─── EARNINGS / RESULTADOS → TARJETA VISUAL con beat/miss/guidance ───
-        EARNINGS_TRIGGERS = [
-            "earnings", "resultados", "han presentado", "ha presentado",
-            "presenta resultados", "presentó resultados", "presento resultados",
-            "reportado", "reporta", "reportó", "reporto",
-            "beat", "miss", "guidance", "guía", "guia",
-            "ventas trimestre", "trimestre", "q1", "q2", "q3", "q4",
-        ]
-        if any(p in txt_low for p in EARNINGS_TRIGGERS):
+        # 7) EARNINGS / RESULTADOS
+        if intent == "earnings":
             typing(chat_id)
             datos = format_data_for_claude(get_real_data(ticker))
             news = search_news(f"{ticker} earnings revenue EPS guidance Q latest", n=4)
             sec_data = sec_get_filings(ticker, n=3)
             full = f"{datos}\n\n=== NOTICIAS RESULTADOS ===\n{news}\n\n{sec_data}"
             prompt = (f"El usuario pregunta por RESULTADOS / EARNINGS de {ticker}. Hoy {hoy}.\n"
-                      f"Pregunta literal: \"{txt}\"\n\n"
-                      f"Responde con la TARJETA VISUAL EXACTA centrándote en:\n"
-                      f"- Título: RESULTADOS o segmento clave (CLOUD/AZURE/AWS/SEARCH/etc)\n"
-                      f"- Bullets: Ventas (Beat/Miss), EBIT, EPS, Guidance, segmento clave\n"
-                      f"- Lectura: si cambia tesis, si mercado exagera, si problema es negocio o "
-                      f"valoración o timing\n"
-                      f"- Señal final ALINEADA con la cartera de Miki\n\n"
-                      f"Si no hay datos confirmados de earnings recientes, di ⚪ NO CONCLUYENTE.")
+                      f"Pregunta: \"{txt}\"\n\n"
+                      f"Tarjeta visual EXACTA: Título RESULTADOS, bullets Ventas/EBIT/EPS/Guidance, "
+                      f"Lectura, Señal final. Si no hay earnings recientes confirmados → ⚪ NO CONCLUYENTE.")
             reply = ask_claude(chat_id, prompt, get_system_card(), web_data=full, max_tokens=700)
             send(chat_id, reply)
             return
 
-        # POR DEFECTO con ticker → TARJETA VISUAL + Instincts auto
+        # 8) VALORACIÓN o TESIS → DEXTER por defecto (FIX v22: dexter siempre activo)
+        if intent in ("valoracion", "tesis"):
+            typing(chat_id)
+            label = "VALORACIÓN COMPLETA" if intent == "valoracion" else "TESIS DE INVERSIÓN"
+            send(chat_id, f"🧠 DEXTER ACTIVO · {label} de {ticker}\n"
+                          f"Plan → Datos (FMP+SEC+Insiders+News+Macro+Wiki) → Reflexión → Plantilla AUTÉNTICA Miki\n"
+                          f"30-45 segundos.")
+            reply = dexter_research(chat_id, ticker, txt)
+            send(chat_id, reply)
+            return
+
+        # 9) NEWS para este ticker
+        if intent == "news":
+            typing(chat_id)
+            send(chat_id, f"Buscando noticias de {ticker}...")
+            news = search_news(f"{ticker} stock news latest today", n=5)
+            datos = format_data_for_claude(get_real_data(ticker))
+            prompt = (f"Resume las noticias de {ticker} para Miki en tono colega 4-6 frases. "
+                      f"Si hay algo importante, márcalo. Datos contexto:\n{datos}")
+            reply = ask_claude(chat_id, prompt, get_system_chat(), web_data=news, max_tokens=500)
+            send(chat_id, reply)
+            return
+
+        # 10) Conversacional sobre la empresa o pregunta abierta → tarjeta visual con tono natural
+        if is_conversational(txt) or intent in ("conversacion", "price"):
+            typing(chat_id)
+            data_raw = get_real_data(ticker)
+            datos = format_data_for_claude(data_raw)
+            instincts = detect_instincts(ticker, data_raw)
+            instincts_block = format_instincts(instincts) if instincts else ""
+            
+            # Si es solo "precio" simple, respuesta corta natural
+            if intent == "price":
+                prompt = (f"Miki te pregunta el precio de {ticker} hoy {hoy}.\n"
+                          f"Pregunta literal: \"{txt}\"\n\n"
+                          f"Responde NATURAL, 2-3 frases máximo, con el precio actual y "
+                          f"variación día. Tono colega. {instincts_block}")
+                reply = ask_claude(chat_id, prompt, get_system_chat(), web_data=datos, max_tokens=200)
+                send(chat_id, reply)
+                return
+            
+            # Conversacional sobre empresa
+            prompt = (f"Datos reales de {ticker} hoy {hoy}.\n"
+                      f"Pregunta del usuario: \"{txt}\"\n"
+                      f"{instincts_block}\n\n"
+                      f"Responde NATURAL en tono colega de bar 3-5 frases. "
+                      f"NO uses tarjeta visual (es conversación). NO inventes datos.")
+            reply = ask_claude(chat_id, prompt, get_system_chat(), web_data=datos, max_tokens=500)
+            send(chat_id, reply)
+            audio = tts(reply[:500])
+            if audio: send_audio(chat_id, audio)
+            return
+
+        # 11) Default con ticker → TARJETA VISUAL
         typing(chat_id)
         data_raw = get_real_data(ticker)
         datos = format_data_for_claude(data_raw)
-        # Instincts automáticos (silencioso pero relevante)
         instincts = detect_instincts(ticker, data_raw)
         instincts_block = format_instincts(instincts) if instincts else ""
-
         prompt = (f"Datos reales de {ticker} hoy {hoy}.\n"
                   f"Pregunta del usuario: \"{txt}\"\n"
                   f"{instincts_block}\n\n"
@@ -3106,6 +3266,7 @@ def handle(chat_id, text):
         send(chat_id, reply)
         return
 
+    # ─── CONVERSACIÓN GENERAL ───
     # ─── CONVERSACIÓN GENERAL ───
     typing(chat_id)
     reply = ask_claude(chat_id, txt, get_system_chat(), max_tokens=500)
@@ -3265,7 +3426,7 @@ def handle_image(chat_id, file_id, caption=""):
 # ═════════════════════════════════════════════════════
 def poll():
     offset = 0
-    logging.info(f"JARVIS v20 INSTINCTS - {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    logging.info(f"JARVIS v22 SHARP - {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     logging.info(f"FMP:{'OK' if FMP_KEY else 'NO'} | "
                  f"Anthropic:{'OK' if ANTHROPIC_KEY else 'NO'} | "
                  f"Whisper:{'OK' if OPENAI_KEY else 'NO'} | "
@@ -3513,11 +3674,11 @@ class H(BaseHTTPRequestHandler):
             if not self._guard(path, protected=False): return
 
             if path in ("/", "/health"):
-                self._text(f"JARVIS v20 INSTINCTS - {datetime.now().strftime('%d/%m/%Y %H:%M')} - Online", 200)
+                self._text(f"JARVIS v22 SHARP - {datetime.now().strftime('%d/%m/%Y %H:%M')} - Online", 200)
                 return
 
             if path == "/app":
-                html = JARVIS_APP_HTML.replace("__APP_VERSION__", "JARVIS v20 INSTINCTS")
+                html = JARVIS_APP_HTML.replace("__APP_VERSION__", "JARVIS v22 SHARP")
                 self._html(html, 200); return
 
             if path == "/favicon.ico":
@@ -3645,4 +3806,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
