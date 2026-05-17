@@ -970,17 +970,25 @@ def normalize_to_ticker(text_or_ticker):
     return None
 
 def cartera_get_all():
-    """Devuelve cartera completa desde Supabase (o lista vacía)."""
-    if not (SUPABASE_URL and SUPABASE_KEY): return []
+    """Devuelve cartera completa desde Supabase (o lista vacía).
+    FIX v22.1: ahora loguea el error EXACTO de Supabase para diagnóstico."""
+    if not (SUPABASE_URL and SUPABASE_KEY):
+        logging.error("[CARTERA] FALTAN SUPABASE_URL o SUPABASE_KEY en Render")
+        return []
     try:
         r = requests.get(f"{SUPABASE_URL}/rest/v1/jarvis_cartera",
             headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
             params={"select": "*", "order": "valor_actual.desc"},
             timeout=8)
         if r.status_code == 200:
-            return r.json()
+            data = r.json()
+            logging.info(f"[CARTERA] OK · {len(data)} posiciones recibidas de Supabase")
+            return data
+        else:
+            # ESTE ES EL FIX CRÍTICO: ver qué dice Supabase REALMENTE
+            logging.error(f"[CARTERA] Supabase devolvió HTTP {r.status_code} · respuesta: {r.text[:500]}")
     except Exception as e:
-        logging.error(f"Cartera get: {e}")
+        logging.error(f"[CARTERA] Excepción: {e}")
     return []
 
 def cartera_summary():
